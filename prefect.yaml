@@ -1,0 +1,8 @@
+version: 1
+deployments:
+  - name: scoring-deploy
+    entrypoint: flows/scoring_flow.py:scoring_flow
+    parameters: {}
+    schedule: null
+    work_pool:
+      name: cloud-run-pool
