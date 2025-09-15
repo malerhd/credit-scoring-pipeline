@@ -9,10 +9,10 @@ from datetime import datetime, timezone
 import os, base64
 from google.oauth2 import service_account
 
-def _gcp_credentials():
+def _get_gcp_credentials():
     b64 = os.getenv("SERVICE_ACCOUNT_B64")
     if not b64:
-        raise RuntimeError("Falta SERVICE_ACCOUNT_B64 en Job Variables / entorno.")
+        raise RuntimeError("Falta SERVICE_ACCOUNT_B64 en variables de entorno del deployment.")
     info = json.loads(base64.b64decode(b64).decode("utf-8"))
     return service_account.Credentials.from_service_account_info(info)
 
@@ -43,10 +43,11 @@ def _month_floor(d: datetime.date) -> datetime.date:
 @task
 def read_json(gcs_path: str) -> dict:
     bucket, blob_path = _parse_gcs_uri(gcs_path)
-    creds = _gcp_credentials()                         # 👈
-    blob = storage.Client(credentials=creds)           # 👈
-    .bucket(bucket).blob(blob_path)
-    return json.loads(blob.download_as_text())
+    client = storage.Client(credentials=_get_gcp_credentials())
+    blob = client.bucket(bucket).blob(blob_path)
+    content = blob.download_as_text()
+    return json.loads(content)
+
 
 
 
