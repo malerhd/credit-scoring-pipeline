@@ -191,7 +191,7 @@ def parse_tn_sales_to_monthly(payload: dict, client_key: str, platform: str) -> 
 # ─────────────────────────────────────────────────────────
 @task
 def ensure_bq_objects(project_id: str):
-    creds = _gcp_credentials()  # 👈 usa el helper que agregamos al inicio
+    creds = _get_gcp_credentials()  # 👈 usa el helper que agregamos al inicio
     bq = bigquery.Client(project=project_id, credentials=creds)
     # dataset
     bq.query(f"CREATE SCHEMA IF NOT EXISTS `{project_id}.gold`").result()
@@ -281,7 +281,7 @@ def _merge_table(bq: bigquery.Client, df: pd.DataFrame, target: str, keys: list[
 
 @task
 def upsert_ads_monthly(df: pd.DataFrame, project_id: str) -> int:
-    creds = _gcp_credentials()                         # 👈
+    creds = _get_gcp_credentials()                         # 👈
     bq = bigquery.Client(project=project_id, credentials=creds)  # 👈
     return _merge_table(
         bq, df,
@@ -291,7 +291,7 @@ def upsert_ads_monthly(df: pd.DataFrame, project_id: str) -> int:
 
 @task
 def upsert_ga_monthly(df: pd.DataFrame, project_id: str) -> int:
-    creds = _gcp_credentials()
+    creds = _get_gcp_credentials()
     bq = bigquery.Client(project=project_id, credentials=creds)
     return _merge_table(
         bq, df,
@@ -301,7 +301,7 @@ def upsert_ga_monthly(df: pd.DataFrame, project_id: str) -> int:
 
 @task
 def upsert_tn_sales_monthly(df: pd.DataFrame, project_id: str) -> int:
-    creds = _gcp_credentials()
+    creds = _get_gcp_credentials()
     bq = bigquery.Client(project=project_id, credentials=creds)
     return _merge_table(
         bq, df,
