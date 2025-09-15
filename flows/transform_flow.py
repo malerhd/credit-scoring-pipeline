@@ -285,7 +285,7 @@ def upsert_ads_monthly(df: pd.DataFrame, project_id: str) -> int:
     bq = bigquery.Client(project=project_id, credentials=creds)  # 👈
     return _merge_table(
         bq, df,
-        target=f"{project_id}.gold.ads_monthly}",
+        target=f"{project_id}.gold.ads_monthly",
         keys=["client_key", "platform", "month", "campaign_id"]
     )
 
@@ -295,7 +295,7 @@ def upsert_ga_monthly(df: pd.DataFrame, project_id: str) -> int:
     bq = bigquery.Client(project=project_id, credentials=creds)
     return _merge_table(
         bq, df,
-        target=f"{project_id}.gold.ga_monthly}",
+        target=f"{project_id}.gold.ga_monthly",
         keys=["client_key", "platform", "month"]
     )
 
@@ -305,7 +305,7 @@ def upsert_tn_sales_monthly(df: pd.DataFrame, project_id: str) -> int:
     bq = bigquery.Client(project=project_id, credentials=creds)
     return _merge_table(
         bq, df,
-        target=f"{project_id}.gold.tn_sales_monthly}",
+        target=f"{project_id}.gold.tn_sales_monthly",
         keys=["client_key", "platform", "month", "currency"]
     )
 
