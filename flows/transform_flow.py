@@ -6,6 +6,15 @@ import pandas as pd
 import json
 from urllib.parse import urlparse
 from datetime import datetime, timezone
+import os, base64
+from google.oauth2 import service_account
+
+def _gcp_credentials():
+    b64 = os.getenv("SERVICE_ACCOUNT_B64")
+    if not b64:
+        raise RuntimeError("Falta SERVICE_ACCOUNT_B64 en Job Variables / entorno.")
+    info = json.loads(base64.b64decode(b64).decode("utf-8"))
+    return service_account.Credentials.from_service_account_info(info)
 
 # ─────────────────────────────────────────────────────────
 # Helpers
@@ -34,8 +43,12 @@ def _month_floor(d: datetime.date) -> datetime.date:
 @task
 def read_json(gcs_path: str) -> dict:
     bucket, blob_path = _parse_gcs_uri(gcs_path)
-    blob = storage.Client().bucket(bucket).blob(blob_path)
+    creds = _gcp_credentials()                         # 👈
+    blob = storage.Client(credentials=creds)           # 👈
+    .bucket(bucket).blob(blob_path)
     return json.loads(blob.download_as_text())
+
+
 
 # ─────────────────────────────────────────────────────────
 # Parsers
@@ -177,9 +190,11 @@ def parse_tn_sales_to_monthly(payload: dict, client_key: str, platform: str) -> 
 # ─────────────────────────────────────────────────────────
 @task
 def ensure_bq_objects(project_id: str):
-    bq = bigquery.Client(project=project_id)
+    creds = _gcp_credentials()  # 👈 usa el helper que agregamos al inicio
+    bq = bigquery.Client(project=project_id, credentials=creds)
     # dataset
     bq.query(f"CREATE SCHEMA IF NOT EXISTS `{project_id}.gold`").result()
+
 
     # Meta Ads
     bq.query(f"""
@@ -265,30 +280,34 @@ def _merge_table(bq: bigquery.Client, df: pd.DataFrame, target: str, keys: list[
 
 @task
 def upsert_ads_monthly(df: pd.DataFrame, project_id: str) -> int:
-    bq = bigquery.Client(project=project_id)
+    creds = _gcp_credentials()                         # 👈
+    bq = bigquery.Client(project=project_id, credentials=creds)  # 👈
     return _merge_table(
         bq, df,
-        target=f"{project_id}.gold.ads_monthly",
+        target=f"{project_id}.gold.ads_monthly}",
         keys=["client_key", "platform", "month", "campaign_id"]
     )
 
 @task
 def upsert_ga_monthly(df: pd.DataFrame, project_id: str) -> int:
-    bq = bigquery.Client(project=project_id)
+    creds = _gcp_credentials()
+    bq = bigquery.Client(project=project_id, credentials=creds)
     return _merge_table(
         bq, df,
-        target=f"{project_id}.gold.ga_monthly",
+        target=f"{project_id}.gold.ga_monthly}",
         keys=["client_key", "platform", "month"]
     )
 
 @task
 def upsert_tn_sales_monthly(df: pd.DataFrame, project_id: str) -> int:
-    bq = bigquery.Client(project=project_id)
+    creds = _gcp_credentials()
+    bq = bigquery.Client(project=project_id, credentials=creds)
     return _merge_table(
         bq, df,
-        target=f"{project_id}.gold.tn_sales_monthly",
+        target=f"{project_id}.gold.tn_sales_monthly}",
         keys=["client_key", "platform", "month", "currency"]
     )
+
 
 # ─────────────────────────────────────────────────────────
 # Flow principal
