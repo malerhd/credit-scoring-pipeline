@@ -24,15 +24,38 @@ def _parse_gcs_uri(gcs_path: str) -> tuple[str, str]:
     u = urlparse(gcs_path)
     return u.netloc, u.path.lstrip("/")
 
-def _to_date_yyyy_mm_dd(s: str) -> datetime.date:
-    """Acepta 'YYYY-MM-DD' o 'YYYYMMDD' y devuelve date."""
+def _to_date_yyyy_mm_dd(s: str):
     if not s:
         return None
     s = s.strip()
+    # 1) GA: 'YYYYMMDD'
     if len(s) == 8 and s.isdigit():
-        # GA: '20240911'
         return datetime.strptime(s, "%Y%m%d").date()
-    return datetime.fromisoformat(s.replace("Z", "+00:00")).date() if ("T" in s or "-" in s) else datetime.strptime(s, "%Y-%m-%d").date()
+
+    # 2) Normalizaciones comunes
+    #  - Z -> +00:00
+    #  - +0000 -> +00:00
+    #  - .000Z -> +00:00
+    s_norm = (
+        s.replace("Z", "+00:00")
+         .replace("+0000", "+00:00")
+         .replace(".000+00:00", "+00:00")
+         .replace(".000Z", "+00:00")
+    )
+    # Algunos backends devuelven "2025-09-09 23:52:29+00:00" (espacio en lugar de 'T')
+    if " " in s_norm and "T" not in s_norm:
+        s_norm = s_norm.replace(" ", "T", 1)
+
+    try:
+        return datetime.fromisoformat(s_norm).date()
+    except ValueError:
+        # Fallback robusto
+        from email.utils import parsedate_to_datetime
+        try:
+            return parsedate_to_datetime(s).date()
+        except Exception:
+            # último recurso: parsear solo la parte de fecha
+            return datetime.strptime(s[:10], "%Y-%m-%d").date()
 
 def _month_floor(d: datetime.date) -> datetime.date:
     return datetime(d.year, d.month, 1, tzinfo=timezone.utc).date()
@@ -306,7 +329,7 @@ def upsert_tn_sales_monthly(df: pd.DataFrame, project_id: str) -> int:
     return _merge_table(
         bq, df,
         target=f"{project_id}.gold.tn_sales_monthly",
-        keys=["client_key", "platform", "month", "currency","created at"]
+        keys=["client_key", "platform", "month", "currency"]
     )
 
 
