@@ -1,0 +1,8 @@
+version: 1
+deployments:
+  - name: scoring-deploy
+    entrypoint: flows/scoring_flow.py:scoring_flow
+    work_pool:
+      name: serverless-pool
+    job_variables:
+      pip_packages: ["prefect","google-cloud-storage","google-cloud-bigquery","pandas","pyarrow"]

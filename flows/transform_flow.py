@@ -306,7 +306,7 @@ def upsert_tn_sales_monthly(df: pd.DataFrame, project_id: str) -> int:
     return _merge_table(
         bq, df,
         target=f"{project_id}.gold.tn_sales_monthly",
-        keys=["client_key", "platform", "month", "currency"]
+        keys=["client_key", "platform", "month", "currency","created at"]
     )
 
 
