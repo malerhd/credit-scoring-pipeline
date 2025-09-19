@@ -1,8 +1,28 @@
 version: 1
 deployments:
-  - name: scoring-deploy
-    entrypoint: flows/scoring_flow.py:scoring_flow
+  - name: scoring-deploy                       # nombre del deployment (lo podés dejar igual)
+    entrypoint: flows/score_simple_flow.py:score_monthly_simple
+    parameters:
+      project_id: "loopi-470817"
+      client_key: "analytics@redhookdata.com"
+      target_table: "loopi-470817.gold.scoring_client_minimal"
+      months_back: 24
+      aggregate_last_n: 12
+      seguidores: 376000
+      engagement_rate_redes: 0.045
     work_pool:
-      name: serverless-pool
+      name: serverless-pool                    # tu pool de Prefect Cloud (serverless)
     job_variables:
-      pip_packages: ["prefect","google-cloud-storage","google-cloud-bigquery","pandas","pyarrow"]
+      # Serverless instala estos paquetes en la ejecución
+      pip_packages: ["prefect","google-cloud-storage","google-cloud-bigquery","google-auth","pandas","numpy","pyarrow"]
+      # Pasamos la credencial como env var (recomendado usar un Secret Block)
+      env:
+        SERVICE_ACCOUNT_B64: "{{ prefect.blocks.secret.gcpsab64 }}"
+    pull:                                      # Prefect Cloud clonará el repo antes de ejecutar
+      - prefect.deployments.steps.git_clone:
+          repository: "https://github.com/malerhd/credit-scoring-pipeline.git"   # ← poné tu URL
+          branch: "main"
+          # Si es privado, descomentá la línea de abajo y creá el block 'github_pat'
+          # access_token: "{{ prefect.blocks.secret.github_pat }}"
+      - prefect.deployments.steps.set_working_directory:
+          directory: "{{ clone_directory }}"
