@@ -11,12 +11,10 @@ import os, json, base64
 def _get_gcp_credentials():
     b64 = os.getenv("SERVICE_ACCOUNT_B64")
     if not b64:
-        # opcional: usa archivo si preferís
-        return service_account.Credentials.from_service_account_file(
-            r"C:\keys\loopi-sa.json"  # <- si NO usás SERVICE_ACCOUNT_B64, poné tu ruta real
-        )
+        raise RuntimeError("Falta SERVICE_ACCOUNT_B64 (cargá el Secret en Prefect y mapealo en el deployment).")
     info = json.loads(base64.b64decode(b64).decode("utf-8"))
     return service_account.Credentials.from_service_account_info(info)
+
 
 # ── Tareas ────────────────────────────────────────────────────────────────────
 @task
