@@ -161,25 +161,39 @@ def parse_ga_to_monthly(payload: dict, client_key: str, platform: str) -> pd.Dat
     return g
 
 @task
-def parse_tn_sales_to_monthly(payload: dict, client_key: str, platform: str) -> pd.DataFrame:
+def parse_tn_sales_to_monthly(payload: dict, client_key: str, platform: str, only_paid: bool = False) -> pd.DataFrame:
     """
-    Tienda Nube: usamos ventas[]. Agregamos a mensual por 'created_at' (UTC del JSON).
-    Métricas: orders, gross_revenue (total), subtotal, discount, currency, avg_order_value.
+    Tienda Nube: soporta payload con 'ventas' (array) o 'ventas_diarias' (dict fecha -> [órdenes]).
+    Agrega a mensual por 'created_at'. Métricas: orders, gross_revenue, subtotal, discount, currency, avg_order_value.
+    - Si only_paid=True, filtra sólo órdenes con payment_status='paid'.
     """
+    # 1) Aplanar ventas
     ventas = payload.get("ventas", [])
+    if not ventas:
+        vd = payload.get("ventas_diarias", {})
+        if isinstance(vd, dict):
+            ventas = [o for _, arr in vd.items() for o in (arr or [])]
+
     if not ventas:
         return pd.DataFrame()
 
     rows = []
     for v in ventas:
-        created = v.get("created_at")  # "2025-09-09T23:52:29+0000"
+        created = v.get("created_at")  # ej: "2025-09-12T11:48:30+0000"
         order_date = _to_date_yyyy_mm_dd(created)
+        if not order_date:
+            continue
+        if only_paid and str(v.get("payment_status", "")).lower() != "paid":
+            continue
+
         month = _month_floor(order_date)
-        currency = v.get("currency")
+        # ⚠️ currency puede venir vacío en 'ventas_diarias'; usamos 'NA' para que el MERGE matchee
+        currency = (v.get("currency") or "NA")
+
         total = float(v.get("total", 0) or 0)
         subtotal = float(v.get("subtotal", 0) or 0)
         discount = float(v.get("discount", 0) or 0) + float(v.get("discount_gateway", 0) or 0)
-        payment_status = v.get("payment_status")
+        paid = 1 if str(v.get("payment_status", "")).lower() == "paid" else 0
 
         rows.append({
             "client_key": client_key,
@@ -190,7 +204,7 @@ def parse_tn_sales_to_monthly(payload: dict, client_key: str, platform: str) -> 
             "subtotal": subtotal,
             "discount": discount,
             "currency": currency,
-            "paid": 1 if (str(payment_status).lower() == "paid") else 0,
+            "paid": paid,
         })
 
     df = pd.DataFrame(rows)
@@ -205,7 +219,8 @@ def parse_tn_sales_to_monthly(payload: dict, client_key: str, platform: str) -> 
         paid=("paid", "sum"),
     )
     g["avg_order_value"] = g.apply(
-        lambda r: (r["gross_revenue"] / r["orders"]) if r["orders"] else 0.0, axis=1
+        lambda r: (r["gross_revenue"] / r["orders"]) if r["orders"] else 0.0,
+        axis=1
     )
     return g
 
