@@ -1,14 +1,22 @@
 # flows/orchestrate_client_flow.py
 from __future__ import annotations
 
-import json
+import json, os, base64
 from prefect import flow, get_run_logger
 from google.cloud import bigquery
 from google.api_core.exceptions import NotFound
+from google.oauth2 import service_account
 from flows.transform_flow import transform_flow
 from flows.score_simple_flow import score_monthly_simple
 
 VALID_PLATFORMS = {"tn", "ga", "meta-ads"}
+
+def _get_gcp_credentials():
+    b64 = os.getenv("SERVICE_ACCOUNT_B64")
+    if not b64:
+        raise RuntimeError("Falta SERVICE_ACCOUNT_B64 (mapeá el Secret en Job Variables del deployment).")
+    info = json.loads(base64.b64decode(b64).decode("utf-8"))
+    return service_account.Credentials.from_service_account_info(info)
 
 def _path_for(platform: str, client_key: str) -> str:
     base = f"gs://loopi-data-dev/{client_key}"
@@ -19,17 +27,10 @@ def _path_for(platform: str, client_key: str) -> str:
     }[platform]
 
 def _normalize_platforms_arg(platforms) -> list[str] | None:
-    """
-    Acepta list/tuple/set, string JSON (p.ej. '["tn","ga"]'), string vacío, '[]',
-    o texto con líneas/comas, y devuelve lista normalizada o None.
-    """
     if platforms is None:
         return None
-
     if isinstance(platforms, (list, tuple, set)):
-        out = [str(x).strip() for x in platforms if str(x).strip()]
-        return out
-
+        return [str(x).strip() for x in platforms if str(x).strip()]
     if isinstance(platforms, str):
         s = platforms.strip()
         if s in ("", "[]", "null", "None"):
@@ -41,9 +42,7 @@ def _normalize_platforms_arg(platforms) -> list[str] | None:
             if isinstance(val, str):
                 return [val.strip()]
         except Exception:
-            tokens = [t.strip() for t in s.replace("\n", ",").split(",") if t.strip()]
-            return tokens
-
+            return [t.strip() for t in s.replace("\n", ",").split(",") if t.strip()]
     return [str(platforms).strip()]
 
 def _available_platforms(bq: bigquery.Client, project_id: str, client_key: str, max_age_minutes: int) -> list[str]:
@@ -65,7 +64,6 @@ def _available_platforms(bq: bigquery.Client, project_id: str, client_key: str, 
         )
         return [r["platform"] for r in job.result()]
     except Exception:
-        # Si la tabla ops.snapshot_status no existe aún, devolvemos vacío
         return []
 
 @flow(name="orchestrate-client")
@@ -75,23 +73,24 @@ def orchestrate_client(
     target_table: str = "loopi-470817.gold.scoring_client_minimal",
     months_back: int = 24,
     aggregate_last_n: int = 12,
-    platforms: list[str] | None = None,   # opcional
-    max_age_minutes: int = 1440,          # qué tan “fresco” debe ser el snapshot
+    platforms: list[str] | None = None,
+    max_age_minutes: int = 1440,
     seguidores: int = 376000,
     engagement_rate_redes: float = 0.045,
 ):
     logger = get_run_logger()
-    bq = bigquery.Client(project=project_id)
+    creds = _get_gcp_credentials()
+    bq = bigquery.Client(project=project_id, credentials=creds)
 
-    # 1) Normalizar lo que venga de UI/CLI
+    # Normalizar parámetro
     platforms = _normalize_platforms_arg(platforms)
 
-    # 2) Si no vino nada → autodetectar desde ops.snapshot_status
+    # Autodetectar si viene vacío
     if not platforms:
         platforms = _available_platforms(bq, project_id, client_key, max_age_minutes)
         logger.info(f"Plataformas detectadas para {client_key}: {platforms}")
 
-    # 3) Filtrar a válidas
+    # Filtrar válidas
     platforms = [p for p in platforms if p in VALID_PLATFORMS]
     logger.info(f"Plataformas a procesar (normalizadas): {platforms}")
 
@@ -99,7 +98,7 @@ def orchestrate_client(
         logger.warning(f"No hay plataformas para procesar en {client_key}. Salgo.")
         return 0
 
-    # 4) Transform por cada plataforma; si falta snapshot, saltar
+    # Transform por cada plataforma; si falta snapshot, saltar
     for p in platforms:
         try:
             n = transform_flow(
@@ -112,7 +111,7 @@ def orchestrate_client(
         except NotFound as e:
             logger.warning(f"Skipping {p}: snapshot no encontrado ({e})")
 
-    # 5) Scoring
+    # Scoring
     score = score_monthly_simple(
         project_id=project_id,
         client_key=client_key,
@@ -124,5 +123,3 @@ def orchestrate_client(
     )
     logger.info(f"Score {client_key}: {score}")
     return score
-
-
