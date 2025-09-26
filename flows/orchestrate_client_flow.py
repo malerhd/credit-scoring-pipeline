@@ -1,4 +1,19 @@
 # flows/orchestrate_client_flow.py
+from prefect import get_run_logger
+import google.auth
+from google.cloud import bigquery
+
+def orchestrate_client(...):
+    log = get_run_logger()
+    creds, proj = google.auth.default()
+    sa = getattr(creds, "service_account_email", None)
+    log.info(f"[ADC] project={proj} principal={sa or type(creds).__name__}")
+
+    bq_client = bigquery.Client()
+    log.info(f"[BQ] client.project={bq_client.project} location={bq_client.location or 'default'}")
+
+
+
 from __future__ import annotations
 
 import json, os, base64
