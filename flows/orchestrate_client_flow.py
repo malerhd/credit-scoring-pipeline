@@ -2,21 +2,35 @@
 from __future__ import annotations
 
 import json, os, base64
+from urllib.parse import urlparse
+from datetime import datetime, timezone
+
 from prefect import flow, get_run_logger
-from google.cloud import bigquery
+from google.cloud import bigquery, storage
 from google.api_core.exceptions import NotFound
 from google.oauth2 import service_account
+
 from flows.transform_flow import transform_flow
 from flows.score_simple_flow import score_monthly_simple
 
 VALID_PLATFORMS = {"tn", "ga", "meta-ads"}
 
+# ─────────────────────────────────────────────────────────
+# Credenciales
+# ─────────────────────────────────────────────────────────
 def _get_gcp_credentials():
     b64 = os.getenv("SERVICE_ACCOUNT_B64")
     if not b64:
         raise RuntimeError("Falta SERVICE_ACCOUNT_B64 (mapeá el Secret en Job Variables del deployment).")
     info = json.loads(base64.b64decode(b64).decode("utf-8"))
     return service_account.Credentials.from_service_account_info(info)
+
+# ─────────────────────────────────────────────────────────
+# Helpers GCS / Paths
+# ─────────────────────────────────────────────────────────
+def _parse_gcs_uri(gcs_uri: str) -> tuple[str, str]:
+    u = urlparse(gcs_uri)
+    return u.netloc, u.path.lstrip("/")
 
 def _path_for(platform: str, client_key: str) -> str:
     base = f"gs://loopi-data-dev/{client_key}"
@@ -26,6 +40,60 @@ def _path_for(platform: str, client_key: str) -> str:
         "meta-ads": f"{base}/meta-ads/snapshot-latest.json",
     }[platform]
 
+def _gcs_fingerprint(gcs_uri: str, creds) -> str | None:
+    """Devuelve generation del blob si existe; None si no existe."""
+    bucket, blob_path = _parse_gcs_uri(gcs_uri)
+    sc = storage.Client(credentials=creds)
+    blob = sc.bucket(bucket).blob(blob_path)
+    if not blob.exists():
+        return None
+    blob.reload()  # carga metadatos
+    return str(blob.generation)
+
+# ─────────────────────────────────────────────────────────
+# Cursor en BigQuery (para no reprocesar)
+# ─────────────────────────────────────────────────────────
+def _read_cursor(bq: bigquery.Client, project_id: str, client_key: str, platform: str) -> str | None:
+    sql = f"""
+    SELECT last_generation
+    FROM `{project_id}.ops.snapshot_cursor`
+    WHERE client_key=@ck AND platform=@pf
+    LIMIT 1
+    """
+    rows = list(bq.query(
+        sql,
+        job_config=bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("ck","STRING", client_key),
+                bigquery.ScalarQueryParameter("pf","STRING", platform),
+            ]
+        )
+    ).result())
+    return rows[0]["last_generation"] if rows else None
+
+def _write_cursor(bq: bigquery.Client, project_id: str, client_key: str, platform: str, generation: str):
+    sql = f"""
+    MERGE `{project_id}.ops.snapshot_cursor` T
+    USING (SELECT @ck AS client_key, @pf AS platform, @gen AS last_generation, CURRENT_TIMESTAMP() AS last_updated) S
+    ON T.client_key=S.client_key AND T.platform=S.platform
+    WHEN MATCHED THEN UPDATE SET last_generation=S.last_generation, last_updated=S.last_updated
+    WHEN NOT MATCHED THEN INSERT (client_key, platform, last_generation, last_updated)
+    VALUES (S.client_key, S.platform, S.last_generation, S.last_updated)
+    """
+    bq.query(
+        sql,
+        job_config=bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("ck","STRING", client_key),
+                bigquery.ScalarQueryParameter("pf","STRING", platform),
+                bigquery.ScalarQueryParameter("gen","STRING", generation),
+            ]
+        )
+    ).result()
+
+# ─────────────────────────────────────────────────────────
+# Helpers varios
+# ─────────────────────────────────────────────────────────
 def _normalize_platforms_arg(platforms) -> list[str] | None:
     if platforms is None:
         return None
@@ -45,7 +113,8 @@ def _normalize_platforms_arg(platforms) -> list[str] | None:
             return [t.strip() for t in s.replace("\n", ",").split(",") if t.strip()]
     return [str(platforms).strip()]
 
-def _available_platforms(bq: bigquery.Client, project_id: str, client_key: str, max_age_minutes: int) -> list[str]:
+# (Opcional) autodetección por tabla, si más adelante querés usarla
+def _available_platforms_by_table(bq: bigquery.Client, project_id: str, client_key: str, max_age_minutes: int) -> list[str]:
     sql = f"""
     SELECT platform
     FROM `{project_id}.ops.snapshot_status`
@@ -66,6 +135,9 @@ def _available_platforms(bq: bigquery.Client, project_id: str, client_key: str, 
     except Exception:
         return []
 
+# ─────────────────────────────────────────────────────────
+# Flow
+# ─────────────────────────────────────────────────────────
 @flow(name="orchestrate-client")
 def orchestrate_client(
     project_id: str,
@@ -82,15 +154,23 @@ def orchestrate_client(
     creds = _get_gcp_credentials()
     bq = bigquery.Client(project=project_id, credentials=creds)
 
-    # Normalizar parámetro
+    # 1) Normalizar parámetro
     platforms = _normalize_platforms_arg(platforms)
 
-    # Autodetectar si viene vacío
+    # 2) Autodetectar por GCS si viene vacío; si sigue vacío, opcionalmente probar tabla
     if not platforms:
-        platforms = _available_platforms(bq, project_id, client_key, max_age_minutes)
+        detected = []
+        for p in VALID_PLATFORMS:
+            uri = _path_for(p, client_key)
+            if _gcs_fingerprint(uri, creds):
+                detected.append(p)
+        if not detected:
+            # fallback opcional a tabla (si la usás)
+            detected = _available_platforms_by_table(bq, project_id, client_key, max_age_minutes)
+        platforms = detected
         logger.info(f"Plataformas detectadas para {client_key}: {platforms}")
 
-    # Filtrar válidas
+    # 3) Filtrar válidas
     platforms = [p for p in platforms if p in VALID_PLATFORMS]
     logger.info(f"Plataformas a procesar (normalizadas): {platforms}")
 
@@ -98,28 +178,48 @@ def orchestrate_client(
         logger.warning(f"No hay plataformas para procesar en {client_key}. Salgo.")
         return 0
 
-    # Transform por cada plataforma; si falta snapshot, saltar
+    processed_any = False
+
+    # 4) Por cada plataforma, procesar solo si hay snapshot NUEVO (por generation)
     for p in platforms:
+        uri = _path_for(p, client_key)
+        fp = _gcs_fingerprint(uri, creds)
+        if not fp:
+            logger.warning(f"[{p}] snapshot no existe en GCS → salto")
+            continue
+
+        last = _read_cursor(bq, project_id, client_key, p)
+        if last == fp:
+            logger.info(f"[{p}] misma generation {fp} ya procesada → nada que hacer")
+            continue
+
         try:
             n = transform_flow(
-                gcs_path=_path_for(p, client_key),
+                gcs_path=uri,
                 client_key=client_key,
                 platform=p,
                 project_id=project_id,
             )
-            logger.info(f"[{p}] upsert rows: {n}")
+            logger.info(f"[{p}] transform upsert rows: {n}")
+            _write_cursor(bq, project_id, client_key, p, fp)
+            processed_any = True
         except NotFound as e:
             logger.warning(f"Skipping {p}: snapshot no encontrado ({e})")
 
-    # Scoring
-    score = score_monthly_simple(
-        project_id=project_id,
-        client_key=client_key,
-        target_table=target_table,
-        months_back=months_back,
-        aggregate_last_n=aggregate_last_n,
-        seguidores=seguidores,
-        engagement_rate_redes=engagement_rate_redes,
-    )
-    logger.info(f"Score {client_key}: {score}")
-    return score
+    # 5) Scoring una sola vez si hubo novedades
+    if processed_any:
+        logger.info("Ejecutando scoring…")
+        score = score_monthly_simple(
+            project_id=project_id,
+            client_key=client_key,
+            target_table=target_table,
+            months_back=months_back,
+            aggregate_last_n=aggregate_last_n,
+            seguidores=seguidores,
+            engagement_rate_redes=engagement_rate_redes,
+        )
+        logger.info(f"Score {client_key}: {score}")
+        return score
+    else:
+        logger.info("No hubo novedades; no ejecuto scoring.")
+        return 0
