@@ -1,16 +1,60 @@
 # flows/orchestrate_client_flow.py
+# imports (asegurate de tener estos)
+import os, json, base64, re
 from prefect import get_run_logger
-import google.auth
+from google.oauth2 import service_account
+from google.cloud import bigquery  # si no estaba importado acá
+
+def _get_gcp_credentials():
+    """
+    Lee credenciales desde SERVICE_ACCOUNT_B64 (JSON crudo o Base64).
+    Si no hay secret, devuelve None para usar ADC/default.
+    """
+    log = get_run_logger()
+    raw = (os.getenv("SERVICE_ACCOUNT_B64") or "").strip()
+    if not raw:
+        log.warning("[AUTH] SERVICE_ACCOUNT_B64 vacío; uso ADC/default")
+        return None
+
+    try:
+        if raw.lstrip().startswith("{"):            # JSON crudo
+            info = json.loads(raw)
+        else:                                       # Base64 (con padding)
+            s = re.sub(r"\s+", "", raw)
+            s += "=" * (-len(s) % 4)
+            info = json.loads(base64.b64decode(s).decode("utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"SERVICE_ACCOUNT_B64 inválido (JSON/Base64): {e}")
+
+    log.info("[AUTH] usando credenciales del Secret")
+    return service_account.Credentials.from_service_account_info(info)
+
+
 from google.cloud import bigquery
 
-def orchestrate_client(...):
+def orchestrate_client(..., project_id: str, ...):
     log = get_run_logger()
-    creds, proj = google.auth.default()
-    sa = getattr(creds, "service_account_email", None)
-    log.info(f"[ADC] project={proj} principal={sa or type(creds).__name__}")
 
-    bq_client = bigquery.Client()
+    # 1) Tomá credenciales del Secret si están, si no, usa ADC/default
+    creds = _get_gcp_credentials()  # devuelve None si no hay secret válido
+
+    # 2) Construí el cliente con o sin creds explícitas
+    bq_client = bigquery.Client(project=project_id, credentials=creds) if creds else bigquery.Client(project=project_id)
+
+    # 3) Logueá quién es el principal efectivo (del Secret o del ADC)
+    principal = getattr(creds, "service_account_email", None)
+    if not principal:
+        # cuando usamos ADC, tratamos de identificar quién es
+        import google.auth
+        adc_creds, adc_proj = google.auth.default()
+        principal = getattr(adc_creds, "service_account_email", None) or type(adc_creds).__name__
+        log.info(f"[AUTH] ADC project={adc_proj} principal={principal}")
+    else:
+        log.info(f"[AUTH] usando SA del Secret: {principal}")
+
     log.info(f"[BQ] client.project={bq_client.project} location={bq_client.location or 'default'}")
+
+    # ... resto del flow
 
 
 
