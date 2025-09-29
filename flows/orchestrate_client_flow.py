@@ -1,10 +1,31 @@
 # flows/orchestrate_client_flow.py
-# imports (asegurate de tener estos)
-import os, json, base64, re
-from prefect import get_run_logger
-from google.oauth2 import service_account
-from google.cloud import bigquery  # si no estaba importado acá
 
+from __future__ import annotations
+
+# Stdlib
+import os
+import re
+import json
+import base64
+from urllib.parse import urlparse
+
+# Terceros
+from prefect import flow, get_run_logger
+from google.cloud import bigquery, storage
+from google.api_core.exceptions import NotFound
+from google.oauth2 import service_account
+
+# Flows internos
+from flows.transform_flow import transform_flow
+from flows.score_simple_flow import score_monthly_simple
+
+# Plataformas soportadas
+VALID_PLATFORMS = {"tn", "ga", "meta-ads"}
+
+
+# ─────────────────────────────────────────────────────────
+# Credenciales (tolerante: JSON crudo o Base64; corrige padding)
+# ─────────────────────────────────────────────────────────
 def _get_gcp_credentials():
     """
     Lee credenciales desde SERVICE_ACCOUNT_B64 (JSON crudo o Base64).
@@ -17,9 +38,11 @@ def _get_gcp_credentials():
         return None
 
     try:
-        if raw.lstrip().startswith("{"):            # JSON crudo
+        # ¿Pegaron JSON crudo en el Secret?
+        if raw.lstrip().startswith("{"):
             info = json.loads(raw)
-        else:                                       # Base64 (con padding)
+        else:
+            # Limpiar espacios/saltos y arreglar padding de Base64
             s = re.sub(r"\s+", "", raw)
             s += "=" * (-len(s) % 4)
             info = json.loads(base64.b64decode(s).decode("utf-8"))
@@ -30,66 +53,13 @@ def _get_gcp_credentials():
     return service_account.Credentials.from_service_account_info(info)
 
 
-from google.cloud import bigquery
-
-def orchestrate_client(..., project_id: str, ...):
-    log = get_run_logger()
-
-    # 1) Tomá credenciales del Secret si están, si no, usa ADC/default
-    creds = _get_gcp_credentials()  # devuelve None si no hay secret válido
-
-    # 2) Construí el cliente con o sin creds explícitas
-    bq_client = bigquery.Client(project=project_id, credentials=creds) if creds else bigquery.Client(project=project_id)
-
-    # 3) Logueá quién es el principal efectivo (del Secret o del ADC)
-    principal = getattr(creds, "service_account_email", None)
-    if not principal:
-        # cuando usamos ADC, tratamos de identificar quién es
-        import google.auth
-        adc_creds, adc_proj = google.auth.default()
-        principal = getattr(adc_creds, "service_account_email", None) or type(adc_creds).__name__
-        log.info(f"[AUTH] ADC project={adc_proj} principal={principal}")
-    else:
-        log.info(f"[AUTH] usando SA del Secret: {principal}")
-
-    log.info(f"[BQ] client.project={bq_client.project} location={bq_client.location or 'default'}")
-
-    # ... resto del flow
-
-
-
-from __future__ import annotations
-
-import json, os, base64
-from urllib.parse import urlparse
-from datetime import datetime, timezone
-
-from prefect import flow, get_run_logger
-from google.cloud import bigquery, storage
-from google.api_core.exceptions import NotFound
-from google.oauth2 import service_account
-
-from flows.transform_flow import transform_flow
-from flows.score_simple_flow import score_monthly_simple
-
-VALID_PLATFORMS = {"tn", "ga", "meta-ads"}
-
-# ─────────────────────────────────────────────────────────
-# Credenciales
-# ─────────────────────────────────────────────────────────
-def _get_gcp_credentials():
-    b64 = os.getenv("SERVICE_ACCOUNT_B64")
-    if not b64:
-        raise RuntimeError("Falta SERVICE_ACCOUNT_B64 (mapeá el Secret en Job Variables del deployment).")
-    info = json.loads(base64.b64decode(b64).decode("utf-8"))
-    return service_account.Credentials.from_service_account_info(info)
-
 # ─────────────────────────────────────────────────────────
 # Helpers GCS / Paths
 # ─────────────────────────────────────────────────────────
 def _parse_gcs_uri(gcs_uri: str) -> tuple[str, str]:
     u = urlparse(gcs_uri)
     return u.netloc, u.path.lstrip("/")
+
 
 def _path_for(platform: str, client_key: str) -> str:
     base = f"gs://loopi-data-dev/{client_key}"
@@ -99,15 +69,19 @@ def _path_for(platform: str, client_key: str) -> str:
         "meta-ads": f"{base}/meta-ads/snapshot-latest.json",
     }[platform]
 
+
 def _gcs_fingerprint(gcs_uri: str, creds) -> str | None:
-    """Devuelve generation del blob si existe; None si no existe."""
+    """
+    Devuelve 'generation' del blob si existe; None si no existe.
+    """
     bucket, blob_path = _parse_gcs_uri(gcs_uri)
-    sc = storage.Client(credentials=creds)
+    sc = storage.Client(credentials=creds) if creds else storage.Client()
     blob = sc.bucket(bucket).blob(blob_path)
     if not blob.exists():
         return None
     blob.reload()  # carga metadatos
     return str(blob.generation)
+
 
 # ─────────────────────────────────────────────────────────
 # Cursor en BigQuery (para no reprocesar)
@@ -130,6 +104,7 @@ def _read_cursor(bq: bigquery.Client, project_id: str, client_key: str, platform
     ).result())
     return rows[0]["last_generation"] if rows else None
 
+
 def _write_cursor(bq: bigquery.Client, project_id: str, client_key: str, platform: str, generation: str):
     sql = f"""
     MERGE `{project_id}.ops.snapshot_cursor` T
@@ -149,6 +124,7 @@ def _write_cursor(bq: bigquery.Client, project_id: str, client_key: str, platfor
             ]
         )
     ).result()
+
 
 # ─────────────────────────────────────────────────────────
 # Helpers varios
@@ -172,8 +148,11 @@ def _normalize_platforms_arg(platforms) -> list[str] | None:
             return [t.strip() for t in s.replace("\n", ",").split(",") if t.strip()]
     return [str(platforms).strip()]
 
-# (Opcional) autodetección por tabla, si más adelante querés usarla
+
 def _available_platforms_by_table(bq: bigquery.Client, project_id: str, client_key: str, max_age_minutes: int) -> list[str]:
+    """
+    Fallback opcional: leer plataformas recientes desde una tabla de estado si existiera.
+    """
     sql = f"""
     SELECT platform
     FROM `{project_id}.ops.snapshot_status`
@@ -194,8 +173,9 @@ def _available_platforms_by_table(bq: bigquery.Client, project_id: str, client_k
     except Exception:
         return []
 
+
 # ─────────────────────────────────────────────────────────
-# Flow
+# Flow principal
 # ─────────────────────────────────────────────────────────
 @flow(name="orchestrate-client")
 def orchestrate_client(
@@ -210,8 +190,22 @@ def orchestrate_client(
     engagement_rate_redes: float = 0.045,
 ):
     logger = get_run_logger()
+
+    # Credenciales (Secret si está, si no ADC)
     creds = _get_gcp_credentials()
-    bq = bigquery.Client(project=project_id, credentials=creds)
+    bq = bigquery.Client(project=project_id, credentials=creds) if creds else bigquery.Client(project=project_id)
+
+    # Log de identidad efectiva
+    principal = getattr(creds, "service_account_email", None)
+    if principal:
+        logger.info(f"[AUTH] usando SA del Secret: {principal}")
+    else:
+        import google.auth
+        adc_creds, adc_proj = google.auth.default()
+        principal = getattr(adc_creds, "service_account_email", None) or type(adc_creds).__name__
+        logger.info(f"[AUTH] ADC project={adc_proj} principal={principal}")
+
+    logger.info(f"[BQ] client.project={bq.project} location={bq.location or 'default'}")
 
     # 1) Normalizar parámetro
     platforms = _normalize_platforms_arg(platforms)
@@ -224,7 +218,6 @@ def orchestrate_client(
             if _gcs_fingerprint(uri, creds):
                 detected.append(p)
         if not detected:
-            # fallback opcional a tabla (si la usás)
             detected = _available_platforms_by_table(bq, project_id, client_key, max_age_minutes)
         platforms = detected
         logger.info(f"Plataformas detectadas para {client_key}: {platforms}")
