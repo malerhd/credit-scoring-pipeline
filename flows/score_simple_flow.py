@@ -5,22 +5,39 @@ from google.cloud import bigquery
 from google.oauth2 import service_account
 import pandas as pd
 import numpy as np
-import os, json, base64
+import os, json, base64, re
 
-# ── Credenciales ──────────────────────────────────────────────────────────────
+# ── Credenciales (tolerante) ─────────────────────────────────────────────────
 def _get_gcp_credentials():
-    b64 = os.getenv("SERVICE_ACCOUNT_B64")
-    if not b64:
-        raise RuntimeError("Falta SERVICE_ACCOUNT_B64 (cargá el Secret en Prefect y mapealo en el deployment).")
-    info = json.loads(base64.b64decode(b64).decode("utf-8"))
-    return service_account.Credentials.from_service_account_info(info)
+    """
+    Usa SERVICE_ACCOUNT_B64 si está (JSON crudo o Base64 con padding corregido).
+    Si no está, cae a ADC/GOOGLE_APPLICATION_CREDENTIALS.
+    Devuelve un objeto Credentials o None (para usar ADC).
+    """
+    raw = (os.getenv("SERVICE_ACCOUNT_B64") or "").strip()
+    if not raw:
+        return None  # ADC
 
+    # quitar comillas envolventes si las hubiera
+    if (raw.startswith(("'", '"', "`")) and raw.endswith(raw[0])):
+        raw = raw[1:-1].strip()
+
+    try:
+        if raw.lstrip().startswith("{"):
+            info = json.loads(raw)
+        else:
+            s = re.sub(r"\s+", "", raw)
+            s += "=" * (-len(s) % 4)
+            info = json.loads(base64.b64decode(s).decode("utf-8"))
+        return service_account.Credentials.from_service_account_info(info)
+    except Exception as e:
+        raise RuntimeError(f"SERVICE_ACCOUNT_B64 inválido (JSON/Base64): {e}")
 
 # ── Tareas ────────────────────────────────────────────────────────────────────
 @task
 def ensure_target_table(project_id: str, target_table: str):
     creds = _get_gcp_credentials()
-    bq = bigquery.Client(project=project_id, credentials=creds)
+    bq = bigquery.Client(project=project_id, credentials=creds) if creds else bigquery.Client(project=project_id)
     ddl = f"""
     CREATE TABLE IF NOT EXISTS `{target_table}` (
       client_key STRING,
@@ -32,7 +49,7 @@ def ensure_target_table(project_id: str, target_table: str):
 @task
 def read_monthly_panel(project_id: str, client_key: str, months_back: int) -> pd.DataFrame:
     creds = _get_gcp_credentials()
-    bq = bigquery.Client(project=project_id, credentials=creds)
+    bq = bigquery.Client(project=project_id, credentials=creds) if creds else bigquery.Client(project=project_id)
     sql = f"""
     WITH tn AS (
       SELECT client_key, month,
@@ -94,7 +111,7 @@ def read_monthly_panel(project_id: str, client_key: str, months_back: int) -> pd
 def apply_monthly_scoring(full_df: pd.DataFrame,
                           seguidores: int = 376000,
                           engagement_rate_redes: float = 0.045) -> pd.DataFrame:
-    # tu scoring hardcodeado
+    # scoring actual con inputs de RRSS
     full_df['Cost_google']          = pd.to_numeric(full_df.get('Cost_google', 0), errors='coerce').fillna(0)
     full_df['Cost_meta']            = pd.to_numeric(full_df.get('Cost_meta', 0), errors='coerce').fillna(0)
     full_df['Purchase revenue']     = pd.to_numeric(full_df.get('Purchase revenue', 0), errors='coerce').fillna(0)
@@ -160,12 +177,14 @@ def aggregate_client_score(scored_df: pd.DataFrame,
 @task
 def write_minimal_score(project_id: str, target_table: str, client_key: str, score: float):
     creds = _get_gcp_credentials()
-    bq = bigquery.Client(project=project_id, credentials=creds)
+    bq = bigquery.Client(project=project_id, credentials=creds) if creds else bigquery.Client(project=project_id)
     # upsert simple: borrar previos de ese client_key
-    bq.query(f"DELETE FROM `{target_table}` WHERE client_key = @client_key",
-             job_config=bigquery.QueryJobConfig(
-                 query_parameters=[bigquery.ScalarQueryParameter("client_key","STRING",client_key)]
-             )).result()
+    bq.query(
+        f"DELETE FROM `{target_table}` WHERE client_key = @client_key",
+        job_config=bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("client_key","STRING",client_key)]
+        )
+    ).result()
     out = pd.DataFrame([{"client_key": client_key, "score": float(score)}])
     bq.load_table_from_dataframe(out, target_table).result()
 
@@ -192,7 +211,7 @@ def score_monthly_simple(project_id: str,
     return score_value
 
 if __name__ == "__main__":
-    # correr local (opcional)
+    # correr local (opcional; usará ADC si no definís SERVICE_ACCOUNT_B64)
     score_monthly_simple(
         project_id="loopi-470817",
         client_key="analytics@redhookdata.com",

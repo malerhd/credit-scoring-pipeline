@@ -82,6 +82,33 @@ def _gcs_fingerprint(gcs_uri: str, creds) -> str | None:
     blob.reload()  # carga metadatos
     return str(blob.generation)
 
+def _load_ig_metrics(path: str, creds):
+    """
+    Lee un JSON local o de GCS con métricas IG y devuelve:
+    (seguidores:int, engagement_rate:float)
+    Espera claves: followers, engagementRate (o engagement_rate).
+    """
+    # leer archivo
+    if path.startswith("gs://"):
+        bucket, blob_path = _parse_gcs_uri(path)
+        sc = storage.Client(credentials=creds) if creds else storage.Client()
+        raw = sc.bucket(bucket).blob(blob_path).download_as_text()
+    else:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
+
+    data = json.loads(raw)
+
+    seguidores = int(data.get("followers") or 0)
+    engagement = data.get("engagementRate", data.get("engagement_rate", 0)) or 0
+    try:
+        engagement = float(engagement)
+    except Exception:
+        engagement = 0.0
+
+    return seguidores, engagement
+
+
 
 # ─────────────────────────────────────────────────────────
 # Cursor en BigQuery (para no reprocesar)
