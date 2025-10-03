@@ -253,10 +253,10 @@ def parse_ig_metrics(payload: dict, client_key: str, platform: str) -> pd.DataFr
         "accounts_engaged": int(payload.get("accounts_engaged") or 0),
         "total_interactions": int(payload.get("total_interactions") or 0),
         "media_count": int(payload.get("media_count") or 0),
-        "updated_at": pd.Timestamp.utcnow(tz="UTC"),
+        "updated_at": pd.Timestamp.now(tz="UTC"),
     }
     if row["fetched_at"] is None:
-        row["fetched_at"] = row["metric_timestamp"] or pd.Timestamp.utcnow(tz="UTC")
+        row["fetched_at"] = row["metric_timestamp"] or pd.Timestamp.now(tz="UTC")
     return pd.DataFrame([row])
 
 # ─────────────────────────────────────────────────────────
