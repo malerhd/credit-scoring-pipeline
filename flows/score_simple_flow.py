@@ -17,11 +17,8 @@ def _get_gcp_credentials():
     raw = (os.getenv("SERVICE_ACCOUNT_B64") or "").strip()
     if not raw:
         return None  # ADC
-
-    # quitar comillas envolventes si las hubiera
     if (raw.startswith(("'", '"', "`")) and raw.endswith(raw[0])):
         raw = raw[1:-1].strip()
-
     try:
         if raw.lstrip().startswith("{"):
             info = json.loads(raw)
@@ -108,10 +105,36 @@ def read_monthly_panel(project_id: str, client_key: str, months_back: int) -> pd
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
     return df
 
+@task
+def read_latest_ig_metrics(project_id: str, client_key: str) -> tuple[int, float]:
+    """
+    Devuelve (followers, engagement_rate) del último registro IG en gold.social_metrics.
+    Falla si no hay registros.
+    """
+    creds = _get_gcp_credentials()
+    bq = bigquery.Client(project=project_id, credentials=creds) if creds else bigquery.Client(project=project_id)
+    sql = f"""
+    SELECT followers, engagement_rate
+    FROM `{project_id}.gold.social_metrics`
+    WHERE client_key = @ck
+      AND platform IN ('ig','instagram')
+    ORDER BY fetched_at DESC
+    LIMIT 1
+    """
+    job = bq.query(sql, job_config=bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("ck","STRING", client_key)]
+    ))
+    rows = list(job.result())
+    if not rows:
+        raise RuntimeError(f"[IG] No hay métricas en `{project_id}.gold.social_metrics` para client_key={client_key}.")
+    followers = int(rows[0]["followers"] or 0)
+    engagement = float(rows[0]["engagement_rate"] or 0.0)
+    return followers, engagement
+
 def apply_monthly_scoring(full_df: pd.DataFrame,
-                          seguidores: int = 376000,
-                          engagement_rate_redes: float = 0.045) -> pd.DataFrame:
-    # scoring actual con inputs de RRSS
+                          seguidores: int,
+                          engagement_rate_redes: float) -> pd.DataFrame:
+    # scoring con inputs de RRSS obligatorios (sin fallback)
     full_df['Cost_google']          = pd.to_numeric(full_df.get('Cost_google', 0), errors='coerce').fillna(0)
     full_df['Cost_meta']            = pd.to_numeric(full_df.get('Cost_meta', 0), errors='coerce').fillna(0)
     full_df['Purchase revenue']     = pd.to_numeric(full_df.get('Purchase revenue', 0), errors='coerce').fillna(0)
@@ -151,6 +174,13 @@ def apply_monthly_scoring(full_df: pd.DataFrame,
     full_df['puntaje_cac'] = full_df['CAC'].apply(
         lambda x: puntuar_cac(x, benchmark_cac_ideal, benchmark_cac_muy_alto))
 
+    # Validaciones fuertes de IG
+    if engagement_rate_redes > 1:
+        raise ValueError(f"[IG] engagement_rate {engagement_rate_redes} > 1 (usa proporción 0–1).")
+    if seguidores < 0:
+        raise ValueError(f"[IG] seguidores inválido: {seguidores}")
+    engagement_rate_redes = float(np.clip(engagement_rate_redes, 0.0, 1.0))
+
     rrss_score = float(np.clip(np.log(seguidores + 1) * engagement_rate_redes, 0, 1))
     full_df['RRSS_score']   = rrss_score
     full_df['puntaje_rrss'] = rrss_score
@@ -178,7 +208,6 @@ def aggregate_client_score(scored_df: pd.DataFrame,
 def write_minimal_score(project_id: str, target_table: str, client_key: str, score: float):
     creds = _get_gcp_credentials()
     bq = bigquery.Client(project=project_id, credentials=creds) if creds else bigquery.Client(project=project_id)
-    # upsert simple: borrar previos de ese client_key
     bq.query(
         f"DELETE FROM `{target_table}` WHERE client_key = @client_key",
         job_config=bigquery.QueryJobConfig(
@@ -195,15 +224,22 @@ def score_monthly_simple(project_id: str,
                          target_table: str,
                          months_back: int = 24,
                          aggregate_last_n: int = 12,
-                         seguidores: int = 376000,
-                         engagement_rate_redes: float = 0.045,
+                         seguidores: int = 0,                 # ya no se usan como fallback
+                         engagement_rate_redes: float = 0.0,  # ya no se usan como fallback
                          aggregation_method: str = "mean_last_n") -> float:
     logger = get_run_logger()
     ensure_target_table(project_id, target_table)
+
+    # 1) Panel mensual desde gold.*
     panel = read_monthly_panel(project_id, client_key, months_back)
     if panel.empty:
-        logger.warning("No hay datos para el rango solicitado.")
-        return 0.0
+        raise RuntimeError("No hay datos de panel mensual para el rango solicitado.")
+
+    # 2) IG real desde gold.social_metrics (obligatorio)
+    seguidores, engagement_rate_redes = read_latest_ig_metrics(project_id, client_key)
+    logger.info(f"[IG] métricas: seguidores={seguidores}, engagement={engagement_rate_redes}")
+
+    # 3) Scoring y escritura
     scored = apply_monthly_scoring(panel, seguidores=seguidores, engagement_rate_redes=engagement_rate_redes)
     score_value = aggregate_client_score(scored, months_to_average=aggregate_last_n, method=aggregation_method)
     write_minimal_score(project_id, target_table, client_key, score_value)
@@ -211,7 +247,7 @@ def score_monthly_simple(project_id: str,
     return score_value
 
 if __name__ == "__main__":
-    # correr local (opcional; usará ADC si no definís SERVICE_ACCOUNT_B64)
+    # correr local (usará ADC si no definís SERVICE_ACCOUNT_B64)
     score_monthly_simple(
         project_id="loopi-470817",
         client_key="analytics@redhookdata.com",
