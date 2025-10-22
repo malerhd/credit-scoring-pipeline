@@ -334,16 +334,53 @@ def parse_bcra_to_metrics(payload: dict, client_key: str, platform: str) -> pd.D
 # ─────────────────────────────────────────────────────────
 @task
 def parse_merchant_to_metrics(payload: dict, client_key: str, platform: str) -> pd.DataFrame:
-    products = (payload or {}).get("metrics", {}).get("products", {}).get("products", []) or []
+    """
+    Calcula métricas de Merchant lo más fieles posible a la UI:
+      - Solo productos del SOURCE = 'feed'
+      - Deduplicación por offerId (fallback a id)
+      - "Aprobado" si:
+          * no tiene issues de severidad ERROR, y
+          * (si existe) destinationStatuses indica estado 'approved'/'active'
+      - Mínimos de publicación: title, link, image, price (value+currency), availability ∈ {in stock, preorder, backorder}
+    Devuelve una sola fila agregada.
+    """
+    logger = get_run_logger()
+
     fetched_raw = (payload or {}).get("fetched_at")
     end_raw = (payload or {}).get("endDate")
     fetched_at = pd.to_datetime(str(fetched_raw).replace("Z","+00:00"), utc=True, errors="coerce")
     as_of_date = _to_date_yyyy_mm_dd(end_raw) or (fetched_at.date() if pd.notnull(fetched_at) else datetime.utcnow().date())
 
-    if not products:
+    # Tolerancia a varias formas del JSON
+    products = (payload or {}).get("metrics", {}).get("products", {})
+    if isinstance(products, dict):
+        products = products.get("products") or products.get("items") or []
+    elif isinstance(products, list):
+        products = products
+    else:
+        products = (payload or {}).get("products") or (payload or {}).get("items") or []
+
+    # 1) Filtrar SOLO feed
+    feed_products = [p for p in (products or []) if str(p.get("source", "")).lower() == "feed"]
+
+    # 2) Deduplicar por offerId (fallback a id)
+    seen = set()
+    dedup = []
+    for p in feed_products:
+        key = str(p.get("offerId") or p.get("id") or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        dedup.append(p)
+    products = dedup
+
+    n_total = len(products)
+    logger.info(f"[MERCHANT] feed únicos detectados: {n_total}  fetched_at={fetched_at} as_of_date={as_of_date}")
+
+    if n_total == 0:
         return pd.DataFrame([{
             "client_key": client_key,
-            "platform": platform,  # 'merchant'
+            "platform": platform,
             "as_of_date": as_of_date,
             "fetched_at": fetched_at,
             "n_products": 0,
@@ -353,48 +390,83 @@ def parse_merchant_to_metrics(payload: dict, client_key: str, platform: str) -> 
             "merchant_basic": 0.0,
         }])
 
-    n = len(products)
-    ok_count = 0
-    inv_vals: list[float] = []
-    in_stock = 0
-
-    for p in products:
+    def has_min_publish_fields(p: dict) -> bool:
         title = str(p.get("title") or "").strip()
         link  = str(p.get("link") or "").strip()
         img   = str(p.get("imageLink") or "").strip()
+        pr = p.get("price") or {}
+        price_ok = bool(pr.get("value")) and bool(pr.get("currency"))
+        return bool(title and link and img and price_ok)
+
+    def availability_ok(p: dict) -> tuple[bool, float]:
         avail = str(p.get("availability") or "").strip().lower()
-        source = str(p.get("source") or "").strip().lower()
-
-        has_min = bool(title and link and img)
-        has_price = True
-        if source == "feed":
-            pr = p.get("price") or {}
-            has_price = bool(pr.get("value")) and bool(pr.get("currency"))
-        avail_ok = avail in {"in stock", "preorder", "backorder"}
-        status_ok = has_min and has_price and avail_ok
-        ok_count += 1 if status_ok else 0
-
         if avail == "in stock":
-            inv_vals.append(1.0); in_stock += 1
-        elif avail in {"preorder", "backorder"}:
-            inv_vals.append(0.5)
+            return True, 1.0
+        if avail in {"preorder", "backorder"}:
+            return True, 0.5
+        return False, 0.0
+
+    def is_approved(p: dict) -> bool:
+        # 1) Issues de severidad ERROR => no aprobado
+        issues = p.get("issues") or []
+        for it in issues:
+            sev = str(it.get("severity") or "").lower()
+            if sev == "error":
+                return False
+
+        # 2) destinationStatuses si existen
+        dss = p.get("destinationStatuses") or p.get("destinations") or []
+        if isinstance(dss, list) and dss:
+            for ds in dss:
+                # campos típicos: {"destination":"Shopping ads", "approved":true, "status":"active"}
+                approved_flag = ds.get("approved")
+                status = str(ds.get("status") or "").lower()
+                if approved_flag is False:
+                    return False
+                if status in {"disapproved", "inactive"}:
+                    return False
+            # si pasó todos, lo consideramos aprobado
+            return True
+
+        # 3) Fallback: si no hay señales negativas, lo tratamos como aprobado
+        return True
+
+    ok_count = 0
+    inv_vals = []
+    in_stock_cnt = 0
+
+    for p in products:
+        min_ok = has_min_publish_fields(p)
+        avail_ok, inv_val = availability_ok(p)
+        approved = is_approved(p)
+
+        status_ok = (min_ok and avail_ok and approved)
+        if status_ok:
+            ok_count += 1
+            inv_vals.append(inv_val)
+            if inv_val == 1.0:
+                in_stock_cnt += 1
         else:
+            # para inventario solo consideramos aprobados; los no aprobados no suman
             inv_vals.append(0.0)
 
-    product_status_ok_share = ok_count / n
-    inventory_score = sum(inv_vals) / n
-    in_stock_share = in_stock / n
-    merchant_basic = 0.70 * product_status_ok_share + 0.30 * inventory_score
+    n_approved = ok_count
+    product_status_ok_share = n_approved / n_total if n_total else 0.0
+    inventory_score = (sum(inv_vals) / n_approved) if n_approved else 0.0
+    in_stock_share = (in_stock_cnt / n_approved) if n_approved else 0.0
+
+    # Score compuesto: priorizamos % aprobados y luego inventario entre aprobados
+    merchant_basic = 0.75 * product_status_ok_share + 0.25 * inventory_score
 
     return pd.DataFrame([{
         "client_key": client_key,
         "platform": platform,
         "as_of_date": as_of_date,
         "fetched_at": fetched_at,
-        "n_products": n,
-        "product_status_ok_share": float(product_status_ok_share),
-        "inventory_score": float(inventory_score),
-        "in_stock_share": float(in_stock_share),
+        "n_products": int(n_total),                    # feed únicos (base UI)
+        "product_status_ok_share": float(product_status_ok_share),  # ~% publicables/aprobados
+        "inventory_score": float(inventory_score),     # calidad de inventario entre aprobados
+        "in_stock_share": float(in_stock_share),       # % en stock entre aprobados
         "merchant_basic": float(merchant_basic),
     }])
 
