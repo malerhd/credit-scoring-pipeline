@@ -55,6 +55,13 @@ def _to_date_yyyy_mm_dd(s: str):
 def _month_floor(d: datetime.date) -> datetime.date:
     return datetime(d.year, d.month, 1, tzinfo=timezone.utc).date()
 
+# NEW: "YYYYMM" -> primer día del mes (DATE)
+def _ym_to_date_first(ym: str):
+    ym = str(ym or "")
+    if len(ym) < 6 or not ym.isdigit():
+        return None
+    return datetime(int(ym[:4]), int(ym[4:6]), 1, tzinfo=timezone.utc).date()
+
 # ─────────────────────────────────────────────────────────
 # IO
 # ─────────────────────────────────────────────────────────
@@ -260,6 +267,138 @@ def parse_ig_metrics(payload: dict, client_key: str, platform: str) -> pd.DataFr
     return pd.DataFrame([row])
 
 # ─────────────────────────────────────────────────────────
+# NEW: BCRA -> métricas 12m (desde 'historicas')
+# ─────────────────────────────────────────────────────────
+@task
+def parse_bcra_to_metrics(payload: dict, client_key: str, platform: str) -> pd.DataFrame:
+    hist = (payload or {}).get("historicas", {}) or {}
+    periods = hist.get("periodos", []) or []
+    fetched_raw = (payload or {}).get("fetched_at")
+    fetched_at = pd.to_datetime(str(fetched_raw).replace("Z","+00:00"), utc=True, errors="coerce")
+
+    if not periods:
+        return pd.DataFrame()
+
+    latest_ym = max(str(p.get("periodo")) for p in periods if p.get("periodo"))
+    # Ventana 12m anclada al último período
+    want = set()
+    y = int(latest_ym[:4]); m = int(latest_ym[4:6])
+    for i in range(12):
+        yy, mm = y, m - i
+        while mm <= 0:
+            yy -= 1; mm += 12
+        want.add(f"{yy:04d}{mm:02d}")
+
+    per_period: dict[str, list[dict]] = {}
+    for p in periods:
+        ym = str(p.get("periodo"))
+        if ym in want:
+            per_period.setdefault(ym, []).extend(p.get("entidades", []) or [])
+
+    worst = None
+    months_bad = 0
+    entities = set()
+
+    for ym, ents in per_period.items():
+        worst_m = 0
+        bad = False
+        for e in ents:
+            sit = int(e.get("situacion", 0) or 0)
+            ent_name = str(e.get("entidad") or "")
+            if sit >= 1:
+                entities.add(ent_name)
+                worst_m = max(worst_m, sit)
+                if sit >= 3:
+                    bad = True
+        if worst_m > 0:
+            worst = worst_m if worst is None else max(worst, worst_m)
+        if bad:
+            months_bad += 1
+
+    if worst is None:
+        worst = 1  # sin deuda reportada en 12m
+
+    out = pd.DataFrame([{
+        "client_key": client_key,
+        "platform": platform,  # 'bcra'
+        "as_of_month": _ym_to_date_first(latest_ym),
+        "fetched_at": fetched_at,
+        "worst_situation_12m": int(worst),
+        "months_bad_12m": int(months_bad),
+        "entity_count_12m": int(len(entities)),
+    }])
+    return out
+
+# ─────────────────────────────────────────────────────────
+# NEW: Merchant -> métrica básica (status + inventario)
+# ─────────────────────────────────────────────────────────
+@task
+def parse_merchant_to_metrics(payload: dict, client_key: str, platform: str) -> pd.DataFrame:
+    products = (payload or {}).get("metrics", {}).get("products", {}).get("products", []) or []
+    fetched_raw = (payload or {}).get("fetched_at")
+    end_raw = (payload or {}).get("endDate")
+    fetched_at = pd.to_datetime(str(fetched_raw).replace("Z","+00:00"), utc=True, errors="coerce")
+    as_of_date = _to_date_yyyy_mm_dd(end_raw) or (fetched_at.date() if pd.notnull(fetched_at) else datetime.utcnow().date())
+
+    if not products:
+        return pd.DataFrame([{
+            "client_key": client_key,
+            "platform": platform,  # 'merchant'
+            "as_of_date": as_of_date,
+            "fetched_at": fetched_at,
+            "n_products": 0,
+            "product_status_ok_share": 0.0,
+            "inventory_score": 0.0,
+            "in_stock_share": 0.0,
+            "merchant_basic": 0.0,
+        }])
+
+    n = len(products)
+    ok_count = 0
+    inv_vals: list[float] = []
+    in_stock = 0
+
+    for p in products:
+        title = str(p.get("title") or "").strip()
+        link  = str(p.get("link") or "").strip()
+        img   = str(p.get("imageLink") or "").strip()
+        avail = str(p.get("availability") or "").strip().lower()
+        source = str(p.get("source") or "").strip().lower()
+
+        has_min = bool(title and link and img)
+        has_price = True
+        if source == "feed":
+            pr = p.get("price") or {}
+            has_price = bool(pr.get("value")) and bool(pr.get("currency"))
+        avail_ok = avail in {"in stock", "preorder", "backorder"}
+        status_ok = has_min and has_price and avail_ok
+        ok_count += 1 if status_ok else 0
+
+        if avail == "in stock":
+            inv_vals.append(1.0); in_stock += 1
+        elif avail in {"preorder", "backorder"}:
+            inv_vals.append(0.5)
+        else:
+            inv_vals.append(0.0)
+
+    product_status_ok_share = ok_count / n
+    inventory_score = sum(inv_vals) / n
+    in_stock_share = in_stock / n
+    merchant_basic = 0.70 * product_status_ok_share + 0.30 * inventory_score
+
+    return pd.DataFrame([{
+        "client_key": client_key,
+        "platform": platform,
+        "as_of_date": as_of_date,
+        "fetched_at": fetched_at,
+        "n_products": n,
+        "product_status_ok_share": float(product_status_ok_share),
+        "inventory_score": float(inventory_score),
+        "in_stock_share": float(in_stock_share),
+        "merchant_basic": float(merchant_basic),
+    }])
+
+# ─────────────────────────────────────────────────────────
 # BigQuery DDL
 # ─────────────────────────────────────────────────────────
 @task
@@ -325,7 +464,7 @@ def ensure_bq_objects(project_id: str):
     CLUSTER BY client_key, platform
     """).result()
 
-    # NEW: Social metrics (Instagram)
+    # Social metrics (Instagram)
     bq.query(f"""
     CREATE TABLE IF NOT EXISTS `{project_id}.gold.social_metrics` (
       client_key STRING,
@@ -346,6 +485,38 @@ def ensure_bq_objects(project_id: str):
       updated_at TIMESTAMP
     )
     PARTITION BY DATE(fetched_at)
+    CLUSTER BY client_key, platform
+    """).result()
+
+    # NEW: BCRA metrics (12m agregadas)
+    bq.query(f"""
+    CREATE TABLE IF NOT EXISTS `{project_id}.gold.bcra_metrics` (
+      client_key STRING,
+      platform STRING,            -- 'bcra'
+      as_of_month DATE,           -- primer día del último período publicado
+      fetched_at TIMESTAMP,
+      worst_situation_12m INT64,
+      months_bad_12m INT64,
+      entity_count_12m INT64
+    )
+    PARTITION BY as_of_month
+    CLUSTER BY client_key, platform
+    """).result()
+
+    # NEW: Merchant metrics (básico)
+    bq.query(f"""
+    CREATE TABLE IF NOT EXISTS `{project_id}.gold.merchant_metrics` (
+      client_key STRING,
+      platform STRING,            -- 'merchant'
+      as_of_date DATE,            -- endDate del snapshot (o fetched_at date)
+      fetched_at TIMESTAMP,
+      n_products INT64,
+      product_status_ok_share FLOAT64,
+      inventory_score FLOAT64,
+      in_stock_share FLOAT64,
+      merchant_basic FLOAT64
+    )
+    PARTITION BY as_of_date
     CLUSTER BY client_key, platform
     """).result()
 
@@ -433,6 +604,28 @@ def upsert_social_metrics(df: pd.DataFrame, project_id: str) -> int:
     bq.query(f"TRUNCATE TABLE `{staging}`").result()
     return len(df)
 
+# NEW: upsert BCRA metrics
+@task
+def upsert_bcra_metrics(df: pd.DataFrame, project_id: str) -> int:
+    creds = _get_gcp_credentials()
+    bq = bigquery.Client(project=project_id, credentials=creds)
+    return _merge_table(
+        bq, df,
+        target=f"{project_id}.gold.bcra_metrics",
+        keys=["client_key", "platform", "as_of_month"]
+    )
+
+# NEW: upsert Merchant metrics
+@task
+def upsert_merchant_metrics(df: pd.DataFrame, project_id: str) -> int:
+    creds = _get_gcp_credentials()
+    bq = bigquery.Client(project=project_id, credentials=creds)
+    return _merge_table(
+        bq, df,
+        target=f"{project_id}.gold.merchant_metrics",
+        keys=["client_key", "platform", "as_of_date"]
+    )
+
 # ─────────────────────────────────────────────────────────
 # Flow principal
 # ─────────────────────────────────────────────────────────
@@ -444,11 +637,13 @@ def transform_flow(gcs_path: str, client_key: str, platform: str, project_id: st
       - 'ga'       -> gold.ga_monthly
       - 'tn'       -> gold.tn_sales_monthly
       - 'ig'       -> gold.social_metrics
+      - 'bcra'     -> gold.bcra_metrics
+      - 'merchant' -> gold.merchant_metrics
 
     Params:
       gcs_path   : gs://loopi-data-dev/<client>/<platform>/snapshot-latest.json
       client_key : identificador lógico del cliente
-      platform   : 'meta-ads' | 'ga' | 'tn' | 'ig'
+      platform   : 'meta-ads' | 'ga' | 'tn' | 'ig' | 'bcra' | 'merchant'
       project_id : GCP project id destino
     """
     logger = get_run_logger()
@@ -478,6 +673,21 @@ def transform_flow(gcs_path: str, client_key: str, platform: str, project_id: st
         df = parse_ig_metrics(payload, client_key, p)
         n = upsert_social_metrics(df, project_id)
         logger.info(f"[IG] upsert rows: {n}")
+        return n
+
+    if p == "bcra":
+        df = parse_bcra_to_metrics(payload, client_key, p)
+        if df.empty:
+            logger.warning("[BCRA] snapshot sin 'historicas' o sin periodos. No se upserta.")
+            return 0
+        n = upsert_bcra_metrics(df, project_id)
+        logger.info(f"[BCRA] upsert rows: {n}  latest={df.iloc[0]['as_of_month']}")
+        return n
+
+    if p == "merchant":
+        df = parse_merchant_to_metrics(payload, client_key, p)
+        n = upsert_merchant_metrics(df, project_id)
+        logger.info(f"[MERCHANT] upsert rows: {n}  as_of={df.iloc[0]['as_of_date']}  n_products={int(df.iloc[0]['n_products'])}")
         return n
 
     msg = f"Plataforma no soportada: {platform}"
