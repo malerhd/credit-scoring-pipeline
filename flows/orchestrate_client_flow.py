@@ -234,19 +234,21 @@ def orchestrate_client(
 
     logger.info(f"[BQ] client.project={bq.project} location={bq.location or 'default'}")
 
-    if not ig_metrics_path:
-    raise RuntimeError("Parámetro obligatorio 'ig_metrics_path' vacío.")
+# IG override (opcional)
+    seguidores = None
+    engagement_rate_redes = None
+    if ig_metrics_path.strip():
+        try:
+            seg, eng = _load_ig_metrics(ig_metrics_path, creds)
+            if seg < 0:
+                raise ValueError("followers negativo")
+            if not (0 <= eng <= 1):
+                raise ValueError("engagementRate fuera de [0,1]")
+            seguidores, engagement_rate_redes = seg, eng
+            logger.info(f"[IG] override JSON: seguidores={seg}, engagement={eng}")
+        except Exception as e:
+            logger.warning(f"[IG] override inválido: {e}. Se usará BQ si existe, o política RRSS.")
 
-try:
-    seguidores, engagement_rate_redes = _load_ig_metrics(ig_metrics_path, creds)
-    # Validaciones simples
-    if seguidores < 0:
-        raise ValueError("followers negativo")
-    if not (0 <= engagement_rate_redes <= 1):
-        raise ValueError("engagementRate fuera de [0,1]")
-    logger.info(f"[IG] métricas JSON: seguidores={seguidores}, engagement={engagement_rate_redes}")
-except Exception as e:
-    raise RuntimeError(f"No se pudo leer/validar IG metrics desde '{ig_metrics_path}': {e}")
 
 
     # 1) Normalizar parámetro
