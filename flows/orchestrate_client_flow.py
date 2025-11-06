@@ -213,9 +213,9 @@ def orchestrate_client(
     aggregate_last_n: int = 12,
     platforms: list[str] | None = None,
     max_age_minutes: int = 1440,
-    seguidores: int = 376000,
-    engagement_rate_redes: float = 0.045,
+    ig_metrics_path: str = "",   # obligatorio: string no vacío
 ):
+
     logger = get_run_logger()
 
     # Credenciales (Secret si está, si no ADC)
@@ -233,6 +233,21 @@ def orchestrate_client(
         logger.info(f"[AUTH] ADC project={adc_proj} principal={principal}")
 
     logger.info(f"[BQ] client.project={bq.project} location={bq.location or 'default'}")
+
+    if not ig_metrics_path:
+    raise RuntimeError("Parámetro obligatorio 'ig_metrics_path' vacío.")
+
+try:
+    seguidores, engagement_rate_redes = _load_ig_metrics(ig_metrics_path, creds)
+    # Validaciones simples
+    if seguidores < 0:
+        raise ValueError("followers negativo")
+    if not (0 <= engagement_rate_redes <= 1):
+        raise ValueError("engagementRate fuera de [0,1]")
+    logger.info(f"[IG] métricas JSON: seguidores={seguidores}, engagement={engagement_rate_redes}")
+except Exception as e:
+    raise RuntimeError(f"No se pudo leer/validar IG metrics desde '{ig_metrics_path}': {e}")
+
 
     # 1) Normalizar parámetro
     platforms = _normalize_platforms_arg(platforms)
