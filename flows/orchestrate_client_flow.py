@@ -1,5 +1,4 @@
 # flows/orchestrate_client_flow.py
-
 from __future__ import annotations
 
 # Stdlib
@@ -19,8 +18,8 @@ from google.oauth2 import service_account
 from flows.transform_flow import transform_flow
 from flows.score_simple_flow import score_monthly_simple
 
-# Plataformas soportadas
-VALID_PLATFORMS = {"tn", "ga", "meta-ads"}
+# Plataformas soportadas (alineado con transform_flow)
+VALID_PLATFORMS = {"tn", "ga", "meta-ads", "ig", "bcra", "merchant"}
 
 
 # ─────────────────────────────────────────────────────────
@@ -63,11 +62,15 @@ def _parse_gcs_uri(gcs_uri: str) -> tuple[str, str]:
 
 def _path_for(platform: str, client_key: str) -> str:
     base = f"gs://loopi-data-dev/{client_key}"
-    return {
+    mapping = {
         "tn":       f"{base}/tiendanube/snapshot-latest.json",
         "ga":       f"{base}/ga/snapshot-latest.json",
         "meta-ads": f"{base}/meta-ads/snapshot-latest.json",
-    }[platform]
+        "ig":       f"{base}/ig/snapshot-latest.json",
+        "bcra":     f"{base}/bcra/snapshot-latest.json",
+        "merchant": f"{base}/merchant/snapshot-latest.json",
+    }
+    return mapping[platform]
 
 
 def _gcs_fingerprint(gcs_uri: str, creds) -> str | None:
@@ -81,6 +84,7 @@ def _gcs_fingerprint(gcs_uri: str, creds) -> str | None:
         return None
     blob.reload()  # carga metadatos
     return str(blob.generation)
+
 
 def _load_ig_metrics(path: str, creds):
     """
@@ -109,7 +113,6 @@ def _load_ig_metrics(path: str, creds):
     return seguidores, engagement
 
 
-
 # ─────────────────────────────────────────────────────────
 # Cursor en BigQuery (para no reprocesar)
 # ─────────────────────────────────────────────────────────
@@ -120,15 +123,17 @@ def _read_cursor(bq: bigquery.Client, project_id: str, client_key: str, platform
     WHERE client_key=@ck AND platform=@pf
     LIMIT 1
     """
-    rows = list(bq.query(
-        sql,
-        job_config=bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("ck","STRING", client_key),
-                bigquery.ScalarQueryParameter("pf","STRING", platform),
-            ]
-        )
-    ).result())
+    rows = list(
+        bq.query(
+            sql,
+            job_config=bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("ck", "STRING", client_key),
+                    bigquery.ScalarQueryParameter("pf", "STRING", platform),
+                ]
+            ),
+        ).result()
+    )
     return rows[0]["last_generation"] if rows else None
 
 
@@ -145,11 +150,11 @@ def _write_cursor(bq: bigquery.Client, project_id: str, client_key: str, platfor
         sql,
         job_config=bigquery.QueryJobConfig(
             query_parameters=[
-                bigquery.ScalarQueryParameter("ck","STRING", client_key),
-                bigquery.ScalarQueryParameter("pf","STRING", platform),
-                bigquery.ScalarQueryParameter("gen","STRING", generation),
+                bigquery.ScalarQueryParameter("ck", "STRING", client_key),
+                bigquery.ScalarQueryParameter("pf", "STRING", platform),
+                bigquery.ScalarQueryParameter("gen", "STRING", generation),
             ]
-        )
+        ),
     ).result()
 
 
@@ -191,8 +196,8 @@ def _available_platforms_by_table(bq: bigquery.Client, project_id: str, client_k
             sql,
             job_config=bigquery.QueryJobConfig(
                 query_parameters=[
-                    bigquery.ScalarQueryParameter("ck","STRING", client_key),
-                    bigquery.ScalarQueryParameter("max_age","INT64", max_age_minutes),
+                    bigquery.ScalarQueryParameter("ck", "STRING", client_key),
+                    bigquery.ScalarQueryParameter("max_age", "INT64", max_age_minutes),
                 ]
             ),
         )
@@ -213,9 +218,8 @@ def orchestrate_client(
     aggregate_last_n: int = 12,
     platforms: list[str] | None = None,
     max_age_minutes: int = 1440,
-    ig_metrics_path: str = "",   # obligatorio: string no vacío
+    ig_metrics_path: str = "",   # opcional: si viene, hace override manual de IG
 ):
-
     logger = get_run_logger()
 
     # Credenciales (Secret si está, si no ADC)
@@ -234,20 +238,20 @@ def orchestrate_client(
 
     logger.info(f"[BQ] client.project={bq.project} location={bq.location or 'default'}")
 
-    if not ig_metrics_path:
-    raise RuntimeError("Parámetro obligatorio 'ig_metrics_path' vacío.")
-
-try:
-    seguidores, engagement_rate_redes = _load_ig_metrics(ig_metrics_path, creds)
-    # Validaciones simples
-    if seguidores < 0:
-        raise ValueError("followers negativo")
-    if not (0 <= engagement_rate_redes <= 1):
-        raise ValueError("engagementRate fuera de [0,1]")
-    logger.info(f"[IG] métricas JSON: seguidores={seguidores}, engagement={engagement_rate_redes}")
-except Exception as e:
-    raise RuntimeError(f"No se pudo leer/validar IG metrics desde '{ig_metrics_path}': {e}")
-
+    # IG override (opcional). Si no viene, dejamos None y el score leerá de BQ o aplicará política.
+    seguidores = None
+    engagement_rate_redes = None
+    if ig_metrics_path and ig_metrics_path.strip():
+        try:
+            seg, eng = _load_ig_metrics(ig_metrics_path, creds)
+            if seg < 0:
+                raise ValueError("followers negativo")
+            if not (0 <= eng <= 1):
+                raise ValueError("engagementRate fuera de [0,1]")
+            seguidores, engagement_rate_redes = seg, eng
+            logger.info(f"[IG] override JSON: seguidores={seg}, engagement={eng}")
+        except Exception as e:
+            logger.warning(f"[IG] override inválido desde '{ig_metrics_path}': {e}. Se usará BQ/política RRSS.")
 
     # 1) Normalizar parámetro
     platforms = _normalize_platforms_arg(platforms)
@@ -256,7 +260,10 @@ except Exception as e:
     if not platforms:
         detected = []
         for p in VALID_PLATFORMS:
-            uri = _path_for(p, client_key)
+            try:
+                uri = _path_for(p, client_key)
+            except KeyError:
+                continue
             if _gcs_fingerprint(uri, creds):
                 detected.append(p)
         if not detected:

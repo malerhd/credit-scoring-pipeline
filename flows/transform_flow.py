@@ -1,20 +1,40 @@
 # flows/transform_flow.py
 from __future__ import annotations
+
 from prefect import flow, task, get_run_logger
 from google.cloud import storage, bigquery
-import pandas as pd
-import json
-from urllib.parse import urlparse
-from datetime import datetime, timezone
-import os, base64
 from google.oauth2 import service_account
 
+import pandas as pd
+import json, os, base64, re
+from urllib.parse import urlparse
+from datetime import datetime, timezone
+
+
+# ─────────────────────────────────────────────────────────
+# Credenciales tolerantes (SERVICE_ACCOUNT_B64 o ADC)
+# ─────────────────────────────────────────────────────────
 def _get_gcp_credentials():
-    b64 = os.getenv("SERVICE_ACCOUNT_B64")
-    if not b64:
-        raise RuntimeError("Falta SERVICE_ACCOUNT_B64 en variables de entorno del deployment.")
-    info = json.loads(base64.b64decode(b64).decode("utf-8"))
-    return service_account.Credentials.from_service_account_info(info)
+    """
+    Si existe SERVICE_ACCOUNT_B64:
+      - Acepta JSON crudo o Base64 (con padding corregido).
+    Si no existe, devuelve None para usar ADC.
+    """
+    raw = (os.getenv("SERVICE_ACCOUNT_B64") or "").strip()
+    if not raw:
+        return None  # ADC
+
+    try:
+        if raw.lstrip().startswith("{"):
+            info = json.loads(raw)
+        else:
+            s = re.sub(r"\s+", "", raw)
+            s += "=" * (-len(s) % 4)
+            info = json.loads(base64.b64decode(s).decode("utf-8"))
+        return service_account.Credentials.from_service_account_info(info)
+    except Exception as e:
+        raise RuntimeError(f"SERVICE_ACCOUNT_B64 inválido (JSON/Base64): {e}")
+
 
 # ─────────────────────────────────────────────────────────
 # Helpers
@@ -24,10 +44,11 @@ def _parse_gcs_uri(gcs_path: str) -> tuple[str, str]:
     u = urlparse(gcs_path)
     return u.netloc, u.path.lstrip("/")
 
+
 def _to_date_yyyy_mm_dd(s: str):
     if not s:
         return None
-    s = s.strip()
+    s = str(s).strip()
     # 1) GA: 'YYYYMMDD'
     if len(s) == 8 and s.isdigit():
         return datetime.strptime(s, "%Y%m%d").date()
@@ -39,7 +60,6 @@ def _to_date_yyyy_mm_dd(s: str):
          .replace(".000+00:00", "+00:00")
          .replace(".000Z", "+00:00")
     )
-    # Algunos backends devuelven "2025-09-09 23:52:29+00:00" (espacio en lugar de 'T')
     if " " in s_norm and "T" not in s_norm:
         s_norm = s_norm.replace(" ", "T", 1)
 
@@ -52,15 +72,17 @@ def _to_date_yyyy_mm_dd(s: str):
         except Exception:
             return datetime.strptime(s[:10], "%Y-%m-%d").date()
 
+
 def _month_floor(d: datetime.date) -> datetime.date:
     return datetime(d.year, d.month, 1, tzinfo=timezone.utc).date()
 
-# NEW: "YYYYMM" -> primer día del mes (DATE)
+
 def _ym_to_date_first(ym: str):
     ym = str(ym or "")
     if len(ym) < 6 or not ym.isdigit():
         return None
     return datetime(int(ym[:4]), int(ym[4:6]), 1, tzinfo=timezone.utc).date()
+
 
 # ─────────────────────────────────────────────────────────
 # IO
@@ -68,9 +90,11 @@ def _ym_to_date_first(ym: str):
 @task
 def read_json(gcs_path: str) -> dict:
     bucket, blob_path = _parse_gcs_uri(gcs_path)
-    client = storage.Client(credentials=_get_gcp_credentials())
-    content = client.bucket(bucket).blob(blob_path).download_as_text()
+    creds = _get_gcp_credentials()
+    sc = storage.Client(credentials=creds) if creds else storage.Client()
+    content = sc.bucket(bucket).blob(blob_path).download_as_text()
     return json.loads(content)
+
 
 # ─────────────────────────────────────────────────────────
 # Parsers
@@ -117,10 +141,11 @@ def parse_meta_ads_monthly(payload: dict, client_key: str, platform: str) -> pd.
     df["roas"] = (df["website_purchase_conversion_value"] / df["spend"]).replace([pd.NA, pd.NaT], 0).fillna(0)
     return df
 
+
 @task
 def parse_ga_to_monthly(payload: dict, client_key: str, platform: str) -> pd.DataFrame:
     """
-    GA4: series.daily con fechas 'YYYYMMDD'. Agregamos a mensual:
+    GA4: series.daily con fechas 'YYYYMMDD'. Agregamos mensual:
       sessions, transactions, purchaseRevenue, averagePurchaseRevenue, purchaseConversionRate.
     """
     daily = payload.get("series", {}).get("daily", [])
@@ -152,6 +177,7 @@ def parse_ga_to_monthly(payload: dict, client_key: str, platform: str) -> pd.Dat
     g.insert(0, "platform", platform)
     g.insert(0, "client_key", client_key)
     return g
+
 
 @task
 def parse_tn_sales_to_monthly(payload: dict, client_key: str, platform: str, only_paid: bool = False) -> pd.DataFrame:
@@ -212,28 +238,15 @@ def parse_tn_sales_to_monthly(payload: dict, client_key: str, platform: str, onl
     )
     return g
 
+
 # ─────────────────────────────────────────────────────────
 # NEW: Parser Instagram / Social metrics
 # ─────────────────────────────────────────────────────────
 @task
 def parse_ig_metrics(payload: dict, client_key: str, platform: str) -> pd.DataFrame:
     """
-    JSON esperado (ejemplo):
-    {
-      "fetched_at": "2025-10-02T21:14:12.263Z",
-      "timestamp": "2025-10-02T21:14:11.249Z",
-      "username": "redhookdata",
-      "followers": 79,
-      "media_count": 9,
-      "reach": 1,
-      "views": 25,
-      "profile_views": 2,
-      "accounts_engaged": 0,
-      "total_interactions": 0,
-      "likes": 0,
-      "impressions": 25,
-      "engagementRate": 0
-    }
+    Espera campos típicos:
+      fetched_at, timestamp, username, followers, engagementRate, reach, impressions, likes, views, ...
     """
     def _to_ts(v):
         if not v:
@@ -265,6 +278,7 @@ def parse_ig_metrics(payload: dict, client_key: str, platform: str) -> pd.DataFr
     if row["fetched_at"] is None:
         row["fetched_at"] = row["metric_timestamp"] or pd.Timestamp.now(tz="UTC")
     return pd.DataFrame([row])
+
 
 # ─────────────────────────────────────────────────────────
 # NEW: BCRA -> métricas 12m (desde 'historicas')
@@ -329,20 +343,17 @@ def parse_bcra_to_metrics(payload: dict, client_key: str, platform: str) -> pd.D
     }])
     return out
 
+
 # ─────────────────────────────────────────────────────────
 # NEW: Merchant -> métrica básica (status + inventario)
 # ─────────────────────────────────────────────────────────
 @task
 def parse_merchant_to_metrics(payload: dict, client_key: str, platform: str) -> pd.DataFrame:
     """
-    Calcula métricas de Merchant lo más fieles posible a la UI:
-      - Solo productos del SOURCE = 'feed'
-      - Deduplicación por offerId (fallback a id)
-      - "Aprobado" si:
-          * no tiene issues de severidad ERROR, y
-          * (si existe) destinationStatuses indica estado 'approved'/'active'
-      - Mínimos de publicación: title, link, image, price (value+currency), availability ∈ {in stock, preorder, backorder}
-    Devuelve una sola fila agregada.
+    Métricas alineadas a UI:
+      - Solo SOURCE='feed', dedup por offerId (fallback id)
+      - Aprobado: sin issues ERROR y destinos no 'disapproved/inactive'
+      - Mínimos: title, link, image, price(value+currency), availability ∈ {in stock, preorder, backorder}
     """
     logger = get_run_logger()
 
@@ -351,7 +362,6 @@ def parse_merchant_to_metrics(payload: dict, client_key: str, platform: str) -> 
     fetched_at = pd.to_datetime(str(fetched_raw).replace("Z","+00:00"), utc=True, errors="coerce")
     as_of_date = _to_date_yyyy_mm_dd(end_raw) or (fetched_at.date() if pd.notnull(fetched_at) else datetime.utcnow().date())
 
-    # Tolerancia a varias formas del JSON
     products = (payload or {}).get("metrics", {}).get("products", {})
     if isinstance(products, dict):
         products = products.get("products") or products.get("items") or []
@@ -360,10 +370,8 @@ def parse_merchant_to_metrics(payload: dict, client_key: str, platform: str) -> 
     else:
         products = (payload or {}).get("products") or (payload or {}).get("items") or []
 
-    # 1) Filtrar SOLO feed
     feed_products = [p for p in (products or []) if str(p.get("source", "")).lower() == "feed"]
 
-    # 2) Deduplicar por offerId (fallback a id)
     seen = set()
     dedup = []
     for p in feed_products:
@@ -407,28 +415,18 @@ def parse_merchant_to_metrics(payload: dict, client_key: str, platform: str) -> 
         return False, 0.0
 
     def is_approved(p: dict) -> bool:
-        # 1) Issues de severidad ERROR => no aprobado
         issues = p.get("issues") or []
         for it in issues:
-            sev = str(it.get("severity") or "").lower()
-            if sev == "error":
+            if str(it.get("severity") or "").lower() == "error":
                 return False
-
-        # 2) destinationStatuses si existen
         dss = p.get("destinationStatuses") or p.get("destinations") or []
         if isinstance(dss, list) and dss:
             for ds in dss:
-                # campos típicos: {"destination":"Shopping ads", "approved":true, "status":"active"}
-                approved_flag = ds.get("approved")
-                status = str(ds.get("status") or "").lower()
-                if approved_flag is False:
+                if ds.get("approved") is False:
                     return False
-                if status in {"disapproved", "inactive"}:
+                if str(ds.get("status") or "").lower() in {"disapproved", "inactive"}:
                     return False
-            # si pasó todos, lo consideramos aprobado
             return True
-
-        # 3) Fallback: si no hay señales negativas, lo tratamos como aprobado
         return True
 
     ok_count = 0
@@ -439,23 +437,20 @@ def parse_merchant_to_metrics(payload: dict, client_key: str, platform: str) -> 
         min_ok = has_min_publish_fields(p)
         avail_ok, inv_val = availability_ok(p)
         approved = is_approved(p)
-
         status_ok = (min_ok and avail_ok and approved)
+
         if status_ok:
             ok_count += 1
             inv_vals.append(inv_val)
             if inv_val == 1.0:
                 in_stock_cnt += 1
         else:
-            # para inventario solo consideramos aprobados; los no aprobados no suman
             inv_vals.append(0.0)
 
     n_approved = ok_count
     product_status_ok_share = n_approved / n_total if n_total else 0.0
     inventory_score = (sum(inv_vals) / n_approved) if n_approved else 0.0
     in_stock_share = (in_stock_cnt / n_approved) if n_approved else 0.0
-
-    # Score compuesto: priorizamos % aprobados y luego inventario entre aprobados
     merchant_basic = 0.75 * product_status_ok_share + 0.25 * inventory_score
 
     return pd.DataFrame([{
@@ -463,12 +458,13 @@ def parse_merchant_to_metrics(payload: dict, client_key: str, platform: str) -> 
         "platform": platform,
         "as_of_date": as_of_date,
         "fetched_at": fetched_at,
-        "n_products": int(n_total),                    # feed únicos (base UI)
-        "product_status_ok_share": float(product_status_ok_share),  # ~% publicables/aprobados
-        "inventory_score": float(inventory_score),     # calidad de inventario entre aprobados
-        "in_stock_share": float(in_stock_share),       # % en stock entre aprobados
+        "n_products": int(n_total),
+        "product_status_ok_share": float(product_status_ok_share),
+        "inventory_score": float(inventory_score),
+        "in_stock_share": float(in_stock_share),
         "merchant_basic": float(merchant_basic),
     }])
+
 
 # ─────────────────────────────────────────────────────────
 # BigQuery DDL
@@ -476,7 +472,8 @@ def parse_merchant_to_metrics(payload: dict, client_key: str, platform: str) -> 
 @task
 def ensure_bq_objects(project_id: str):
     creds = _get_gcp_credentials()
-    bq = bigquery.Client(project=project_id, credentials=creds)
+    bq = bigquery.Client(project=project_id, credentials=creds) if creds else bigquery.Client(project=project_id)
+
     # dataset
     bq.query(f"CREATE SCHEMA IF NOT EXISTS `{project_id}.gold`").result()
 
@@ -541,8 +538,8 @@ def ensure_bq_objects(project_id: str):
     CREATE TABLE IF NOT EXISTS `{project_id}.gold.social_metrics` (
       client_key STRING,
       platform STRING,                 -- 'instagram' o 'ig'
-      fetched_at TIMESTAMP,            -- del JSON (fetched_at)
-      metric_timestamp TIMESTAMP,      -- del JSON (timestamp)
+      fetched_at TIMESTAMP,
+      metric_timestamp TIMESTAMP,
       username STRING,
       followers INT64,
       engagement_rate FLOAT64,
@@ -560,12 +557,12 @@ def ensure_bq_objects(project_id: str):
     CLUSTER BY client_key, platform
     """).result()
 
-    # NEW: BCRA metrics (12m agregadas)
+    # BCRA metrics
     bq.query(f"""
     CREATE TABLE IF NOT EXISTS `{project_id}.gold.bcra_metrics` (
       client_key STRING,
       platform STRING,            -- 'bcra'
-      as_of_month DATE,           -- primer día del último período publicado
+      as_of_month DATE,
       fetched_at TIMESTAMP,
       worst_situation_12m INT64,
       months_bad_12m INT64,
@@ -575,12 +572,12 @@ def ensure_bq_objects(project_id: str):
     CLUSTER BY client_key, platform
     """).result()
 
-    # NEW: Merchant metrics (básico)
+    # Merchant metrics
     bq.query(f"""
     CREATE TABLE IF NOT EXISTS `{project_id}.gold.merchant_metrics` (
       client_key STRING,
       platform STRING,            -- 'merchant'
-      as_of_date DATE,            -- endDate del snapshot (o fetched_at date)
+      as_of_date DATE,
       fetched_at TIMESTAMP,
       n_products INT64,
       product_status_ok_share FLOAT64,
@@ -591,6 +588,7 @@ def ensure_bq_objects(project_id: str):
     PARTITION BY as_of_date
     CLUSTER BY client_key, platform
     """).result()
+
 
 # ─────────────────────────────────────────────────────────
 # BigQuery MERGE helpers
@@ -617,41 +615,44 @@ def _merge_table(bq: bigquery.Client, df: pd.DataFrame, target: str, keys: list[
     bq.query(f"TRUNCATE TABLE `{staging}`").result()
     return len(df)
 
+
 @task
 def upsert_ads_monthly(df: pd.DataFrame, project_id: str) -> int:
     creds = _get_gcp_credentials()
-    bq = bigquery.Client(project=project_id, credentials=creds)
+    bq = bigquery.Client(project=project_id, credentials=creds) if creds else bigquery.Client(project=project_id)
     return _merge_table(
         bq, df,
         target=f"{project_id}.gold.ads_monthly",
         keys=["client_key", "platform", "month", "campaign_id"]
     )
 
+
 @task
 def upsert_ga_monthly(df: pd.DataFrame, project_id: str) -> int:
     creds = _get_gcp_credentials()
-    bq = bigquery.Client(project=project_id, credentials=creds)
+    bq = bigquery.Client(project=project_id, credentials=creds) if creds else bigquery.Client(project=project_id)
     return _merge_table(
         bq, df,
         target=f"{project_id}.gold.ga_monthly",
         keys=["client_key", "platform", "month"]
     )
 
+
 @task
 def upsert_tn_sales_monthly(df: pd.DataFrame, project_id: str) -> int:
     creds = _get_gcp_credentials()
-    bq = bigquery.Client(project=project_id, credentials=creds)
+    bq = bigquery.Client(project=project_id, credentials=creds) if creds else bigquery.Client(project=project_id)
     return _merge_table(
         bq, df,
         target=f"{project_id}.gold.tn_sales_monthly",
         keys=["client_key", "platform", "month", "currency"]
     )
 
-# NEW: upsert social metrics (IG)
+
 @task
 def upsert_social_metrics(df: pd.DataFrame, project_id: str) -> int:
     creds = _get_gcp_credentials()
-    bq = bigquery.Client(project=project_id, credentials=creds)
+    bq = bigquery.Client(project=project_id, credentials=creds) if creds else bigquery.Client(project=project_id)
     if df.empty:
         return 0
 
@@ -676,27 +677,28 @@ def upsert_social_metrics(df: pd.DataFrame, project_id: str) -> int:
     bq.query(f"TRUNCATE TABLE `{staging}`").result()
     return len(df)
 
-# NEW: upsert BCRA metrics
+
 @task
 def upsert_bcra_metrics(df: pd.DataFrame, project_id: str) -> int:
     creds = _get_gcp_credentials()
-    bq = bigquery.Client(project=project_id, credentials=creds)
+    bq = bigquery.Client(project=project_id, credentials=creds) if creds else bigquery.Client(project=project_id)
     return _merge_table(
         bq, df,
         target=f"{project_id}.gold.bcra_metrics",
         keys=["client_key", "platform", "as_of_month"]
     )
 
-# NEW: upsert Merchant metrics
+
 @task
 def upsert_merchant_metrics(df: pd.DataFrame, project_id: str) -> int:
     creds = _get_gcp_credentials()
-    bq = bigquery.Client(project=project_id, credentials=creds)
+    bq = bigquery.Client(project=project_id, credentials=creds) if creds else bigquery.Client(project=project_id)
     return _merge_table(
         bq, df,
         target=f"{project_id}.gold.merchant_metrics",
         keys=["client_key", "platform", "as_of_date"]
     )
+
 
 # ─────────────────────────────────────────────────────────
 # Flow principal
@@ -711,12 +713,6 @@ def transform_flow(gcs_path: str, client_key: str, platform: str, project_id: st
       - 'ig'       -> gold.social_metrics
       - 'bcra'     -> gold.bcra_metrics
       - 'merchant' -> gold.merchant_metrics
-
-    Params:
-      gcs_path   : gs://loopi-data-dev/<client>/<platform>/snapshot-latest.json
-      client_key : identificador lógico del cliente
-      platform   : 'meta-ads' | 'ga' | 'tn' | 'ig' | 'bcra' | 'merchant'
-      project_id : GCP project id destino
     """
     logger = get_run_logger()
     ensure_bq_objects(project_id)
