@@ -7,11 +7,7 @@ import pandas as pd
 import numpy as np
 import os, json, base64, re
 
-# ==== Extras ====
 from typing import Any, Dict, List, Optional, Tuple, Set
-from datetime import datetime
-import math
-# ===============
 
 # ── Credenciales (tolerante) ─────────────────────────────────────────────────
 def _get_gcp_credentials():
@@ -329,36 +325,24 @@ def write_minimal_score(project_id: str, target_table: str, client_key: str, sco
     out = pd.DataFrame([{"client_key": client_key, "score": float(score)}])
     bq.load_table_from_dataframe(out, target_table).result()
 
-# ── Overlay: Merchant (básico) ───────────────────────────────────────────────
+# ── Overlays opcionales (merchant / bcra) — sin cambios funcionales aquí ─────
 def compute_merchant_basic(merchant_json: Dict[str, Any]) -> Tuple[Optional[float], Dict[str, Any], List[str]]:
-    """
-    Devuelve (MerchantBasic ∈ [0,1] o None si no hay productos, debug, flags).
-    Regla minimalista:
-      - product_status_ok_share: % items con title+link+image y (si source=='feed') price.value+currency
-                                 y availability válido {in stock, preorder, backorder}
-      - inventory_score: mapea availability a {in_stock:1, preorder/backorder:0.5, otros/vacío:0}
-      - MerchantBasic = 0.70*product_status_ok_share + 0.30*inventory_score
-    """
     try:
         products = merchant_json.get("metrics", {}).get("products", {}).get("products", []) or []
     except Exception:
         products = []
-
     n = len(products)
     if n == 0:
         return None, {"reason": "no_products"}, ["mc_missing"]
-
     ok_count = 0
     inv_vals: List[float] = []
     in_stock_count = 0
-
     for p in products:
         title = str(p.get("title") or "").strip()
         link  = str(p.get("link") or "").strip()
         img   = str(p.get("imageLink") or "").strip()
         avail = str(p.get("availability") or "").strip().lower()
         source = str(p.get("source") or "").strip().lower()
-
         has_min = bool(title and link and img)
         has_price = True
         if source == "feed":
@@ -367,23 +351,19 @@ def compute_merchant_basic(merchant_json: Dict[str, Any]) -> Tuple[Optional[floa
         avail_ok = avail in {"in stock", "preorder", "backorder"}
         status_ok = has_min and has_price and avail_ok
         ok_count += 1 if status_ok else 0
-
         if avail == "in stock":
             inv_vals.append(1.0); in_stock_count += 1
         elif avail in {"preorder", "backorder"}:
             inv_vals.append(0.5)
         else:
             inv_vals.append(0.0)
-
     product_status_ok_share = ok_count / n
     inventory_score = sum(inv_vals) / n if n > 0 else 0.0
     in_stock_share = in_stock_count / n if n > 0 else 0.0
-
     merchant_basic = 0.70 * product_status_ok_share + 0.30 * inventory_score
     flags: List[str] = []
     if product_status_ok_share < 0.70: flags.append("mc_low_status")
     if in_stock_share < 0.60: flags.append("mc_low_stock")
-
     debug = {
         "n_products": n,
         "product_status_ok_share": round(product_status_ok_share, 4),
@@ -393,7 +373,6 @@ def compute_merchant_basic(merchant_json: Dict[str, Any]) -> Tuple[Optional[floa
     }
     return float(merchant_basic), debug, flags
 
-# ── Overlay: BCRA (historicas → 12m) ─────────────────────────────────────────
 def _months_back_from_ym(latest_ym: str, months: int = 12) -> Set[str]:
     y = int(latest_ym[:4]); m = int(latest_ym[4:6])
     out = set()
@@ -409,16 +388,13 @@ def bcra_extract_12m_from_historicas(bcra_json: Dict[str, Any]) -> Dict[str, Any
     periods = hist.get("periodos", []) or []
     if not periods:
         return {"worst_situation_12m": None, "months_bad_12m": None, "entity_count_12m": 0, "periods_considered": []}
-
     latest_ym = max(str(p.get("periodo")) for p in periods if p.get("periodo"))
     win = _months_back_from_ym(latest_ym, months=12)
-
     per_period: Dict[str, List[Dict[str, Any]]] = {}
     for p in periods:
         ym = str(p.get("periodo"))
         if ym in win:
             per_period.setdefault(ym, []).extend(p.get("entidades", []) or [])
-
     worst = None; months_bad = 0; entities: Set[str] = set()
     for ym, entidades in per_period.items():
         worst_month = 0; bad = False
@@ -431,9 +407,7 @@ def bcra_extract_12m_from_historicas(bcra_json: Dict[str, Any]) -> Dict[str, Any
                 if sit >= 3: bad = True
         if worst_month > 0: worst = worst_month if worst is None else max(worst, worst_month)
         if bad: months_bad += 1
-
-    if worst is None: worst = 1  # sin deuda en 12m
-
+    if worst is None: worst = 1
     return {
         "as_of_month": latest_ym,
         "worst_situation_12m": int(worst),
@@ -450,20 +424,16 @@ def bcra_to_score_agg(worst_situation_12m: Optional[int],
         return None, {"reason": "missing_worst"}, ["bcra_missing"]
     if base_map is None:
         base_map = {1:1.00, 2:0.85, 3:0.55, 4:0.25, 5:0.00, 6:0.00}
-
     base = base_map.get(int(worst_situation_12m), 0.0)
     months_penalty = 1.0
     if months_bad_12m is not None:
         months_penalty = max(0.5, 1.0 - months_coef * int(months_bad_12m))
-
     score = max(0.0, min(1.0, base * months_penalty))
-
     flags: List[str] = []
     if worst_situation_12m >= 5:
         flags.append("bcra_critical")
     elif worst_situation_12m == 4 and (months_bad_12m is not None and months_bad_12m >= 3):
         flags.append("bcra_high_risk")
-
     dbg = {
         "worst_situation_12m": int(worst_situation_12m),
         "months_bad_12m": int(months_bad_12m or 0),
@@ -473,15 +443,11 @@ def bcra_to_score_agg(worst_situation_12m: Optional[int],
     }
     return float(score), dbg, flags
 
-# ── Blend + Caps ─────────────────────────────────────────────────────────────
 def blend_overlay(base01: float,
                   merchant01: Optional[float],
                   bcra01: Optional[float],
                   wM: float = 0.08,
                   wB: float = 0.07) -> float:
-    """
-    Mezcla convexa con renormalización si falta alguna fuente.
-    """
     parts: List[float] = [base01]; weights: List[float] = [max(0.0, 1.0 - wM - wB)]
     if merchant01 is not None: parts.append(merchant01); weights.append(wM)
     if bcra01 is not None:     parts.append(bcra01);     weights.append(wB)
@@ -491,13 +457,10 @@ def blend_overlay(base01: float,
     return sum(p*w for p, w in zip(parts, weights))
 
 def apply_bcra_overrides(final01: float, bcra_flags: List[str]) -> float:
-    """
-    Caps por política sobre 0–1.
-    """
     if "bcra_critical" in bcra_flags:
-        return min(final01, 0.35)  # 35/100
+        return min(final01, 0.35)
     if "bcra_high_risk" in bcra_flags:
-        return min(final01, 0.55)  # 55/100
+        return min(final01, 0.55)
     return final01
 
 # ── Flow ─────────────────────────────────────────────────────────────────────
@@ -507,16 +470,15 @@ def score_monthly_simple(project_id: str,
                          target_table: str,
                          months_back: int = 24,
                          aggregate_last_n: int = 12,
-                         seguidores: int = 0,                 # legacy (no se usa si IG auto)
-                         engagement_rate_redes: float = 0.0,  # legacy
+                         seguidores: Optional[int] = None,           # ahora pueden venir overrides
+                         engagement_rate_redes: Optional[float] = None,
                          aggregation_method: str = "mean_last_n",
-                         rrss_policy: str = "renormalize",    # 'renormalize' | 'neutral'
-                         ga_fallback_aov: float = 0.0,        # AOV para estimar revenue GA si falta
+                         rrss_policy: str = "renormalize",
+                         ga_fallback_aov: float = 0.0,
                          merchant_json: Optional[Dict[str, Any]] = None,
                          bcra_json: Optional[Dict[str, Any]] = None,
-                         wM: float = 0.08,  # peso Merchant básico
-                         wB: float = 0.07   # peso BCRA
-                         ) -> float:
+                         wM: float = 0.08,
+                         wB: float = 0.07) -> float:
     logger = get_run_logger()
     ensure_target_table(project_id, target_table)
 
@@ -525,14 +487,18 @@ def score_monthly_simple(project_id: str,
     if panel.empty:
         raise RuntimeError("No hay datos de panel mensual para el rango solicitado.")
 
-    # 2) IG (NO obligatorio)
-    ig_seguidores: Optional[int] = None
-    ig_engagement: Optional[float] = None
-    try:
-        ig_seguidores, ig_engagement = read_latest_ig_metrics(project_id, client_key)
-        logger.info(f"[IG] métricas: seguidores={ig_seguidores}, engagement={ig_engagement}")
-    except Exception as e:
-        logger.warning(f"[IG] no disponible: {e}. Política RRSS='{rrss_policy}'.")
+    # 2) IG: si NO vinieron overrides, leo de BQ; si vinieron, uso los pasados
+    ig_seguidores: Optional[int] = seguidores
+    ig_engagement: Optional[float] = engagement_rate_redes
+    if ig_seguidores is None or ig_engagement is None:
+        try:
+            ig_seguidores, ig_engagement = read_latest_ig_metrics(project_id, client_key)
+            logger.info(f"[IG] métricas (BQ): seguidores={ig_seguidores}, engagement={ig_engagement}")
+        except Exception as e:
+            logger.warning(f"[IG] no disponible: {e}. Política RRSS='{rrss_policy}'.")
+            ig_seguidores, ig_engagement = None, None
+    else:
+        logger.info(f"[IG] overrides recibidos: seguidores={ig_seguidores}, engagement={ig_engagement}")
 
     # 3) Scoring base
     scored = apply_monthly_scoring(
@@ -571,7 +537,6 @@ def score_monthly_simple(project_id: str,
         f"[BCRA] {b_dbg} flags={b_flags} "
         f"[FINAL] {score_value:.2f}"
     )
-
     return score_value
 
 if __name__ == "__main__":
@@ -583,9 +548,10 @@ if __name__ == "__main__":
         months_back=24,
         aggregate_last_n=12,
         rrss_policy="renormalize",
-        ga_fallback_aov=50000,  # si no querés estimar, poné 0.0
-        # merchant_json=...,     # dict del Content API
-        # bcra_json=...,         # dict de tu servicio BCRA
+        ga_fallback_aov=50000,
+        # si querés forzar overrides de IG para probar:
+        # seguidores=1200,
+        # engagement_rate_redes=0.012,
         wM=0.08,
         wB=0.07
     )
