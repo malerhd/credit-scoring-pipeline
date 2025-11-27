@@ -1,4 +1,3 @@
-# flows/orchestrate_client_flow.py
 from __future__ import annotations
 
 # Stdlib
@@ -8,115 +7,113 @@ import json
 import base64
 from urllib.parse import urlparse
 
-# Terceros
+# Third-party
 from prefect import flow, get_run_logger
 from google.cloud import bigquery, storage
 from google.api_core.exceptions import NotFound
 from google.oauth2 import service_account
 
-# Flows internos
+# Internal flows
 from flows.transform_flow import transform_flow
 from flows.score_simple_flow import score_monthly_simple
 
-# Plataformas soportadas (alineado con transform_flow)
+# Supported platforms
 VALID_PLATFORMS = {"tn", "ga", "meta-ads", "ig", "bcra", "merchant"}
 
 
-# ─────────────────────────────────────────────────────────
-# Credenciales (tolerante: JSON crudo o Base64; corrige padding)
-# ─────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# GCP CREDENTIALS
+# -----------------------------------------------------------------------------
 def _get_gcp_credentials():
     """
-    Lee credenciales desde SERVICE_ACCOUNT_B64 (JSON crudo o Base64).
-    Si no hay secret, devuelve None para usar ADC/default.
+    Reads SERVICE_ACCOUNT_B64 (raw JSON or Base64).
+    If not present → uses ADC (default credentials).
     """
-    log = get_run_logger()
+    logger = get_run_logger()
     raw = (os.getenv("SERVICE_ACCOUNT_B64") or "").strip()
+
     if not raw:
-        log.warning("[AUTH] SERVICE_ACCOUNT_B64 vacío; uso ADC/default")
+        logger.warning("[AUTH] SERVICE_ACCOUNT_B64 empty, using ADC/default")
         return None
 
     try:
-        # ¿Pegaron JSON crudo en el Secret?
         if raw.lstrip().startswith("{"):
             info = json.loads(raw)
         else:
-            # Limpiar espacios/saltos y arreglar padding de Base64
-            s = re.sub(r"\s+", "", raw)
-            s += "=" * (-len(s) % 4)
-            info = json.loads(base64.b64decode(s).decode("utf-8"))
+            clean = re.sub(r"\s+", "", raw)
+            clean += "=" * (-len(clean) % 4)
+            info = json.loads(base64.b64decode(clean).decode("utf-8"))
     except Exception as e:
-        raise RuntimeError(f"SERVICE_ACCOUNT_B64 inválido (JSON/Base64): {e}")
+        raise RuntimeError(f"SERVICE_ACCOUNT_B64 invalid: {e}")
 
-    log.info("[AUTH] usando credenciales del Secret")
+    logger.info("[AUTH] Using service account from secret")
     return service_account.Credentials.from_service_account_info(info)
 
 
-# ─────────────────────────────────────────────────────────
-# Helpers GCS / Paths
-# ─────────────────────────────────────────────────────────
-def _parse_gcs_uri(gcs_uri: str) -> tuple[str, str]:
-    u = urlparse(gcs_uri)
+# -----------------------------------------------------------------------------
+# GCS HELPERS
+# -----------------------------------------------------------------------------
+def _parse_gcs_uri(uri: str) -> tuple[str, str]:
+    u = urlparse(uri)
     return u.netloc, u.path.lstrip("/")
 
 
 def _path_for(platform: str, client_key: str) -> str:
     base = f"gs://loopi-data-dev/{client_key}"
-    mapping = {
-        "tn":       f"{base}/tiendanube/snapshot-latest.json",
-        "ga":       f"{base}/ga/snapshot-latest.json",
+    return {
+        "tn": f"{base}/tiendanube/snapshot-latest.json",
+        "ga": f"{base}/ga/snapshot-latest.json",
         "meta-ads": f"{base}/meta-ads/snapshot-latest.json",
-        "ig":       f"{base}/ig/snapshot-latest.json",
-        "bcra":     f"{base}/bcra/snapshot-latest.json",
+        "ig": f"{base}/ig/snapshot-latest.json",
+        "bcra": f"{base}/bcra/snapshot-latest.json",
         "merchant": f"{base}/merchant/snapshot-latest.json",
-    }
-    return mapping[platform]
+    }[platform]
 
 
-def _gcs_fingerprint(gcs_uri: str, creds) -> str | None:
-    """
-    Devuelve 'generation' del blob si existe; None si no existe.
-    """
-    bucket, blob_path = _parse_gcs_uri(gcs_uri)
-    sc = storage.Client(credentials=creds) if creds else storage.Client()
-    blob = sc.bucket(bucket).blob(blob_path)
+def _gcs_fingerprint(uri: str, creds) -> str | None:
+    bucket, path = _parse_gcs_uri(uri)
+    client = storage.Client(credentials=creds) if creds else storage.Client()
+    blob = client.bucket(bucket).blob(path)
+
     if not blob.exists():
         return None
-    blob.reload()  # carga metadatos
+
+    blob.reload()
     return str(blob.generation)
 
 
+# -----------------------------------------------------------------------------
+# IG JSON LOADER
+# -----------------------------------------------------------------------------
 def _load_ig_metrics(path: str, creds):
     """
-    Lee un JSON local o de GCS con métricas IG y devuelve:
-    (seguidores:int, engagement_rate:float)
-    Espera claves: followers, engagementRate (o engagement_rate).
+    Loads followers + engagement_rate from IG JSON file (local or GCS).
     """
-    # leer archivo
     if path.startswith("gs://"):
-        bucket, blob_path = _parse_gcs_uri(path)
+        bucket, bpath = _parse_gcs_uri(path)
         sc = storage.Client(credentials=creds) if creds else storage.Client()
-        raw = sc.bucket(bucket).blob(blob_path).download_as_text()
+        raw = sc.bucket(bucket).blob(bpath).download_as_text()
     else:
         with open(path, "r", encoding="utf-8") as f:
             raw = f.read()
 
     data = json.loads(raw)
 
-    seguidores = int(data.get("followers") or 0)
-    engagement = data.get("engagementRate", data.get("engagement_rate", 0)) or 0
+    followers = int(data.get("followers") or 0)
+    engagement = data.get("engagementRate", data.get("engagement_rate", 0))
+
     try:
         engagement = float(engagement)
-    except Exception:
+    except:
         engagement = 0.0
 
-    return seguidores, engagement
+    return followers, engagement
 
 
-# ─────────────────────────────────────────────────────────
-# Cursor en BigQuery (para no reprocesar)
-# ─────────────────────────────────────────────────────────
-def _read_cursor(bq: bigquery.Client, project_id: str, client_key: str, platform: str) -> str | None:
+# -----------------------------------------------------------------------------
+# BIGQUERY CURSORS (avoid re-processing)
+# -----------------------------------------------------------------------------
+def _read_cursor(bq, project_id, client_key, platform):
     sql = f"""
     SELECT last_generation
     FROM `{project_id}.ops.snapshot_cursor`
@@ -137,35 +134,39 @@ def _read_cursor(bq: bigquery.Client, project_id: str, client_key: str, platform
     return rows[0]["last_generation"] if rows else None
 
 
-def _write_cursor(bq: bigquery.Client, project_id: str, client_key: str, platform: str, generation: str):
+def _write_cursor(bq, project_id, client_key, platform, generation):
     sql = f"""
     MERGE `{project_id}.ops.snapshot_cursor` T
-    USING (SELECT @ck AS client_key, @pf AS platform, @gen AS last_generation, CURRENT_TIMESTAMP() AS last_updated) S
+    USING (SELECT @ck AS client_key, @pf AS platform, @g AS last_generation,
+                  CURRENT_TIMESTAMP() AS last_updated) S
     ON T.client_key=S.client_key AND T.platform=S.platform
-    WHEN MATCHED THEN UPDATE SET last_generation=S.last_generation, last_updated=S.last_updated
-    WHEN NOT MATCHED THEN INSERT (client_key, platform, last_generation, last_updated)
-    VALUES (S.client_key, S.platform, S.last_generation, S.last_updated)
+    WHEN MATCHED THEN
+      UPDATE SET last_generation=S.last_generation, last_updated=S.last_updated
+    WHEN NOT MATCHED THEN
+      INSERT (client_key, platform, last_generation, last_updated)
+      VALUES (S.client_key, S.platform, S.last_generation, S.last_updated)
     """
+
     bq.query(
         sql,
         job_config=bigquery.QueryJobConfig(
             query_parameters=[
                 bigquery.ScalarQueryParameter("ck", "STRING", client_key),
                 bigquery.ScalarQueryParameter("pf", "STRING", platform),
-                bigquery.ScalarQueryParameter("gen", "STRING", generation),
+                bigquery.ScalarQueryParameter("g", "STRING", generation),
             ]
         ),
     ).result()
 
 
-# ─────────────────────────────────────────────────────────
-# Helpers varios
-# ─────────────────────────────────────────────────────────
-def _normalize_platforms_arg(platforms) -> list[str] | None:
+# -----------------------------------------------------------------------------
+# PLATFORM NORMALIZATION
+# -----------------------------------------------------------------------------
+def _normalize_platforms_arg(platforms):
     if platforms is None:
         return None
     if isinstance(platforms, (list, tuple, set)):
-        return [str(x).strip() for x in platforms if str(x).strip()]
+        return [str(p).strip() for p in platforms if str(p).strip()]
     if isinstance(platforms, str):
         s = platforms.strip()
         if s in ("", "[]", "null", "None"):
@@ -176,127 +177,76 @@ def _normalize_platforms_arg(platforms) -> list[str] | None:
                 return [str(x).strip() for x in val if str(x).strip()]
             if isinstance(val, str):
                 return [val.strip()]
-        except Exception:
+        except:
             return [t.strip() for t in s.replace("\n", ",").split(",") if t.strip()]
     return [str(platforms).strip()]
 
 
-def _available_platforms_by_table(bq: bigquery.Client, project_id: str, client_key: str, max_age_minutes: int) -> list[str]:
-    """
-    Fallback opcional: leer plataformas recientes desde una tabla de estado si existiera.
-    """
-    sql = f"""
-    SELECT platform
-    FROM `{project_id}.ops.snapshot_status`
-    WHERE client_key = @ck
-      AND TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), updated, MINUTE) <= @max_age
-    """
-    try:
-        job = bq.query(
-            sql,
-            job_config=bigquery.QueryJobConfig(
-                query_parameters=[
-                    bigquery.ScalarQueryParameter("ck", "STRING", client_key),
-                    bigquery.ScalarQueryParameter("max_age", "INT64", max_age_minutes),
-                ]
-            ),
-        )
-        return [r["platform"] for r in job.result()]
-    except Exception:
-        return []
-
-
-# ─────────────────────────────────────────────────────────
-# Flow principal
-# ─────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# MAIN FLOW
+# -----------------------------------------------------------------------------
 @flow(name="orchestrate-client")
 def orchestrate_client(
     project_id: str,
     client_key: str,
-    target_table: str = "loopi-470817.gold.scoring_client_minimal",
+    target_table: str | None = None,
     months_back: int = 24,
     aggregate_last_n: int = 12,
     platforms: list[str] | None = None,
     max_age_minutes: int = 1440,
-    ig_metrics_path: str = "",   # opcional: si viene, hace override manual de IG
+    ig_metrics_path: str = "",
 ):
     logger = get_run_logger()
 
-    # Credenciales (Secret si está, si no ADC)
+    # Credentials
     creds = _get_gcp_credentials()
     bq = bigquery.Client(project=project_id, credentials=creds) if creds else bigquery.Client(project=project_id)
 
-    # Log de identidad efectiva
-    principal = getattr(creds, "service_account_email", None)
-    if principal:
-        logger.info(f"[AUTH] usando SA del Secret: {principal}")
-    else:
-        import google.auth
-        adc_creds, adc_proj = google.auth.default()
-        principal = getattr(adc_creds, "service_account_email", None) or type(adc_creds).__name__
-        logger.info(f"[AUTH] ADC project={adc_proj} principal={principal}")
+    logger.info(f"[START] client={client_key} project={bq.project}")
 
-    logger.info(f"[BQ] client.project={bq.project} location={bq.location or 'default'}")
+    # IG metrics required
+    if not ig_metrics_path.strip():
+        raise RuntimeError("Missing required parameter: ig_metrics_path")
 
+    try:
+        seguidores, engagement_rate_redes = _load_ig_metrics(ig_metrics_path, creds)
+        logger.info(f"[IG] seguidores={seguidores}, engagement={engagement_rate_redes}")
+    except Exception as e:
+        raise RuntimeError(f"Cannot load IG metrics: {e}")
 
-
-    # IG override (opcional). Si no viene, dejamos None y el score leerá de BQ o aplicará política.
-    seguidores = None
-    engagement_rate_redes = None
-    if ig_metrics_path and ig_metrics_path.strip():
->>>>>>> chore/orchestrator-ig-bcra-merchant
-        try:
-            seg, eng = _load_ig_metrics(ig_metrics_path, creds)
-            if seg < 0:
-                raise ValueError("followers negativo")
-            if not (0 <= eng <= 1):
-                raise ValueError("engagementRate fuera de [0,1]")
-            seguidores, engagement_rate_redes = seg, eng
-            logger.info(f"[IG] override JSON: seguidores={seg}, engagement={eng}")
-        except Exception as e:
-
-            logger.warning(f"[IG] override inválido desde '{ig_metrics_path}': {e}. Se usará BQ/política RRSS.")
->>>>>>> chore/orchestrator-ig-bcra-merchant
-
-    # 1) Normalizar parámetro
+    # Normalize platforms arg
     platforms = _normalize_platforms_arg(platforms)
 
-    # 2) Autodetectar por GCS si viene vacío; si sigue vacío, opcionalmente probar tabla
+    # Autodetect from GCS if empty
     if not platforms:
         detected = []
         for p in VALID_PLATFORMS:
-            try:
-                uri = _path_for(p, client_key)
-            except KeyError:
-                continue
+            uri = _path_for(p, client_key)
             if _gcs_fingerprint(uri, creds):
                 detected.append(p)
-        if not detected:
-            detected = _available_platforms_by_table(bq, project_id, client_key, max_age_minutes)
         platforms = detected
-        logger.info(f"Plataformas detectadas para {client_key}: {platforms}")
+        logger.info(f"[AUTODETECT] platforms={platforms}")
 
-    # 3) Filtrar válidas
+    # Filter valid ones
     platforms = [p for p in platforms if p in VALID_PLATFORMS]
-    logger.info(f"Plataformas a procesar (normalizadas): {platforms}")
-
     if not platforms:
-        logger.warning(f"No hay plataformas para procesar en {client_key}. Salgo.")
+        logger.warning("No platforms to process. Exiting.")
         return 0
 
+    # Process
     processed_any = False
 
-    # 4) Por cada plataforma, procesar solo si hay snapshot NUEVO (por generation)
     for p in platforms:
         uri = _path_for(p, client_key)
         fp = _gcs_fingerprint(uri, creds)
+
         if not fp:
-            logger.warning(f"[{p}] snapshot no existe en GCS → salto")
+            logger.warning(f"[{p}] No snapshot found, skipping")
             continue
 
         last = _read_cursor(bq, project_id, client_key, p)
         if last == fp:
-            logger.info(f"[{p}] misma generation {fp} ya procesada → nada que hacer")
+            logger.info(f"[{p}] Snapshot unchanged ({fp}), skipping")
             continue
 
         try:
@@ -306,26 +256,30 @@ def orchestrate_client(
                 platform=p,
                 project_id=project_id,
             )
-            logger.info(f"[{p}] transform upsert rows: {n}")
+            logger.info(f"[{p}] transform rows={n}")
             _write_cursor(bq, project_id, client_key, p, fp)
             processed_any = True
-        except NotFound as e:
-            logger.warning(f"Skipping {p}: snapshot no encontrado ({e})")
 
-    # 5) Scoring una sola vez si hubo novedades
+        except NotFound:
+            logger.warning(f"[{p}] Not found in GCS, skipping")
+        except Exception as e:
+            logger.error(f"[{p}] Transform error: {e}")
+
+    # Scoring only if updates
     if processed_any:
-        logger.info("Ejecutando scoring…")
         score = score_monthly_simple(
             project_id=project_id,
             client_key=client_key,
-            target_table=target_table,
+            target_table=(
+                target_table or f"{project_id}.gold.scoring_client_minimal"
+            ),
             months_back=months_back,
             aggregate_last_n=aggregate_last_n,
             seguidores=seguidores,
             engagement_rate_redes=engagement_rate_redes,
         )
-        logger.info(f"Score {client_key}: {score}")
+        logger.info(f"[SCORE] client={client_key} score={score}")
         return score
-    else:
-        logger.info("No hubo novedades; no ejecuto scoring.")
-        return 0
+
+    logger.info("No updates → skip scoring.")
+    return 0
