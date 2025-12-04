@@ -6,6 +6,7 @@ import re
 import json
 import base64
 from urllib.parse import urlparse
+from typing import Optional  # <-- agregado
 
 # Third-party
 from prefect import flow, get_run_logger
@@ -194,7 +195,7 @@ def orchestrate_client(
     aggregate_last_n: int = 12,
     platforms: list[str] | None = None,
     max_age_minutes: int = 1440,
-    ig_metrics_path: str = "",
+    ig_metrics_path: Optional[str] = None,  # <-- ahora opcional
 ):
     logger = get_run_logger()
 
@@ -204,15 +205,22 @@ def orchestrate_client(
 
     logger.info(f"[START] client={client_key} project={bq.project}")
 
-    # IG metrics required
-    if not ig_metrics_path.strip():
-        raise RuntimeError("Missing required parameter: ig_metrics_path")
+    # --- IG metrics: opcional/skippeable ---
+    # fallback a ENV si no vino por parámetro
+    if not ig_metrics_path or not ig_metrics_path.strip():
+        ig_metrics_path = (os.getenv("IG_METRICS_PATH") or "").strip()
 
-    try:
-        seguidores, engagement_rate_redes = _load_ig_metrics(ig_metrics_path, creds)
-        logger.info(f"[IG] seguidores={seguidores}, engagement={engagement_rate_redes}")
-    except Exception as e:
-        raise RuntimeError(f"Cannot load IG metrics: {e}")
+    seguidores: int = 0
+    engagement_rate_redes: float = 0.0
+
+    if ig_metrics_path:
+        try:
+            seguidores, engagement_rate_redes = _load_ig_metrics(ig_metrics_path, creds)
+            logger.info(f"[IG] seguidores={seguidores}, engagement={engagement_rate_redes}")
+        except Exception as e:
+            logger.warning(f"[IG] Skipping IG metrics (load failed): {e}")
+    else:
+        logger.info("[IG] Skipping IG metrics: ig_metrics_path not provided")
 
     # Normalize platforms arg
     platforms = _normalize_platforms_arg(platforms)
@@ -283,3 +291,4 @@ def orchestrate_client(
 
     logger.info("No updates → skip scoring.")
     return 0
+
