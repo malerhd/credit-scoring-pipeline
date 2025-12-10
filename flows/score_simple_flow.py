@@ -40,7 +40,7 @@ def ensure_target_table(project_id: str, target_table: str):
     ddl = f"""
     CREATE TABLE IF NOT EXISTS `{target_table}` (
       client_key STRING,
-      score FLOAT64
+      score INT64
     )
     """
     bq.query(ddl).result()
@@ -313,7 +313,7 @@ def aggregate_client_score(scored_df: pd.DataFrame,
     return float(df["score_benchmark_100"].tail(months_to_average).mean())
 
 @task
-def write_minimal_score(project_id: str, target_table: str, client_key: str, score: float):
+def write_minimal_score(project_id: str, target_table: str, client_key: str, score: int):
     creds = _get_gcp_credentials()
     bq = bigquery.Client(project=project_id, credentials=creds) if creds else bigquery.Client(project=project_id)
     bq.query(
@@ -322,7 +322,9 @@ def write_minimal_score(project_id: str, target_table: str, client_key: str, sco
             query_parameters=[bigquery.ScalarQueryParameter("client_key","STRING",client_key)]
         )
     ).result()
-    out = pd.DataFrame([{"client_key": client_key, "score": float(score)}])
+    # score ya debe venir entero 1..1000; por las dudas, casteamos
+    score_int = int(score)
+    out = pd.DataFrame([{"client_key": client_key, "score": score_int}])
     bq.load_table_from_dataframe(out, target_table).result()
 
 # ── Overlays opcionales (merchant / bcra) — sin cambios funcionales aquí ─────
@@ -470,7 +472,7 @@ def score_monthly_simple(project_id: str,
                          target_table: str,
                          months_back: int = 24,
                          aggregate_last_n: int = 12,
-                         seguidores: Optional[int] = None,           # ahora pueden venir overrides
+                         seguidores: Optional[int] = None,           # overrides opcionales
                          engagement_rate_redes: Optional[float] = None,
                          aggregation_method: str = "mean_last_n",
                          rrss_policy: str = "renormalize",
@@ -478,7 +480,7 @@ def score_monthly_simple(project_id: str,
                          merchant_json: Optional[Dict[str, Any]] = None,
                          bcra_json: Optional[Dict[str, Any]] = None,
                          wM: float = 0.08,
-                         wB: float = 0.07) -> float:
+                         wB: float = 0.07) -> int:
     logger = get_run_logger()
     ensure_target_table(project_id, target_table)
 
@@ -526,16 +528,19 @@ def score_monthly_simple(project_id: str,
     # 5) Blend + caps
     blended01 = blend_overlay(base01, m_score01, b_score01, wM=wM, wB=wB)
     blended01_capped = apply_bcra_overrides(blended01, b_flags)
-    score_value = round(blended01_capped * 100.0, 2)
 
-    # 6) Persistencia
+    # 6) Escala final a 1..1000 entero (clamp por las dudas)
+    score_value = int(round(blended01_capped * 1000.0))
+    score_value = max(1, min(1000, score_value))
+
+    # 7) Persistencia
     write_minimal_score(project_id, target_table, client_key, score_value)
 
     logger.info(
         f"[BASE] {base_score_value:.2f} "
         f"[M] {m_dbg} flags={m_flags} "
         f"[BCRA] {b_dbg} flags={b_flags} "
-        f"[FINAL] {score_value:.2f}"
+        f"[FINAL] {score_value:d}"
     )
     return score_value
 
