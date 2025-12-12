@@ -1,4 +1,3 @@
-# flows/score_simple_flow.py
 from __future__ import annotations
 from prefect import flow, task, get_run_logger
 from google.cloud import bigquery
@@ -11,11 +10,6 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 
 # ── Credenciales (tolerante) ─────────────────────────────────────────────────
 def _get_gcp_credentials():
-    """
-    Usa SERVICE_ACCOUNT_B64 si está (JSON crudo o Base64 con padding corregido).
-    Si no está, cae a ADC/GOOGLE_APPLICATION_CREDENTIALS.
-    Devuelve un objeto Credentials o None (para usar ADC).
-    """
     raw = (os.getenv("SERVICE_ACCOUNT_B64") or "").strip()
     if not raw:
         return None  # ADC
@@ -50,13 +44,8 @@ def read_monthly_panel(
     project_id: str,
     client_key: str,
     months_back: int,
-    ga_fallback_aov: float = 0.0,   # AOV a usar si GA no trae revenue (0 = no estimar)
+    ga_fallback_aov: float = 0.0,
 ) -> pd.DataFrame:
-    """
-    Panel mensual con prioridad de fuentes:
-    TN → GA revenue → GA tx×AOV(GA) → GA tx×ga_fallback_aov → 0
-    Soporta gold.ga_daily (date YYYYMMDD) y cae a gold.ga_monthly si no existe.
-    """
     creds = _get_gcp_credentials()
     bq = bigquery.Client(project=project_id, credentials=creds) if creds else bigquery.Client(project=project_id)
 
@@ -222,6 +211,97 @@ def read_latest_ig_metrics(project_id: str, client_key: str) -> tuple[int, float
     engagement = float(rows[0]["engagement_rate"] or 0.0)
     return followers, engagement
 
+# ── NEW: leer TikTok agregado 30d ────────────────────────
+@task
+def read_latest_tiktok_features(project_id: str, client_key: str) -> Optional[dict]:
+    """
+    Lee el último registro de gold.tiktok_merchant_metrics (30d).
+    """
+    creds = _get_gcp_credentials()
+    bq = bigquery.Client(project=project_id, credentials=creds) if creds else bigquery.Client(project=project_id)
+    sql = f"""
+    SELECT *
+    FROM `{project_id}.gold.tiktok_merchant_metrics`
+    WHERE client_key = @ck AND platform = 'tiktok'
+    ORDER BY fetched_at DESC
+    LIMIT 1
+    """
+    job = bq.query(sql, job_config=bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("ck","STRING", client_key)]
+    ))
+    rows = list(job.result())
+    if not rows:
+        return None
+    return dict(rows[0].items())
+
+# ── NEW: score TikTok 0–1 (v1) ──────────────────────────
+def compute_tiktok_score01(row: Optional[dict]) -> Tuple[Optional[float], bool]:
+    """
+    v1: usa ER, comment_rate, share_rate, views_per_follower, consistency.
+    Normalizaciones simples (caps) para 0..1 estable.
+    Devuelve (score01, is_observable_30d).
+    """
+    if not row:
+        return None, False
+
+    is_obs = bool(row.get("is_observable_30d", False))
+    er = float(row.get("er_30d") or 0.0)
+    cr = float(row.get("comment_rate_30d") or 0.0)
+    sr = float(row.get("share_rate_30d") or 0.0)
+    vpf = float(row.get("views_per_follower") or 0.0)
+    cons = float(row.get("consistency_score") or 0.0)
+
+    # Caps/escala (robusto)
+    er01  = float(np.clip(er / 0.15, 0, 1))        # 15% ER cap
+    cr01  = float(np.clip(cr / 0.03, 0, 1))        # 3% comments/views
+    sr01  = float(np.clip(sr / 0.02, 0, 1))        # 2% shares/views
+    cons01= float(np.clip(cons, 0, 1))
+    vpf01 = float(np.clip(np.log1p(vpf) / np.log1p(50.0), 0, 1))  # 50 views per follower ~ top
+
+    # Mix v1
+    quality    = 0.6*sr01 + 0.4*cr01
+    engagement = er01
+    reach      = 0.65*vpf01 + 0.35*sr01
+    consistency= cons01
+    growth     = 0.0  # (cuando tengas followers_net_30d/lag30 lo activamos)
+
+    w = {"quality":0.40, "eng":0.25, "reach":0.20, "growth":0.10, "cons":0.05}
+    score01 = (w["quality"]*quality + w["eng"]*engagement + w["reach"]*reach +
+               w["growth"]*growth + w["cons"]*consistency)
+
+    # Anti-gaming: reach alto con baja calidad/eng → cap
+    if (vpf01 > 0.8) and (quality < 0.2) and (engagement < 0.2):
+        score01 = min(score01, 0.35)
+
+    return float(np.clip(score01, 0.0, 1.0)), is_obs
+
+# ── NEW: blend IG + TikTok para el bloque RRSS ───────────
+def blend_rrss(ig01: Optional[float],
+               tt01: Optional[float],
+               policy: str = "split") -> Optional[float]:
+    """
+    Devuelve un único componente RRSS 0..1:
+      - split: 50/50 si hay IG y TikTok; si hay uno solo, usa ese.
+      - best : toma el máximo.
+      - ig_only / tt_only.
+    """
+    if ig01 is None and tt01 is None:
+        return None
+
+    if policy == "best":
+        return max(x for x in [ig01, tt01] if x is not None)
+
+    if policy == "tt_only":
+        return tt01
+
+    if policy == "ig_only":
+        return ig01
+
+    # split (default)
+    if ig01 is not None and tt01 is not None:
+        return 0.5 * ig01 + 0.5 * tt01
+    return ig01 if ig01 is not None else tt01
+
 def apply_monthly_scoring(full_df: pd.DataFrame,
                           seguidores: Optional[int] = None,
                           engagement_rate_redes: Optional[float] = None,
@@ -230,20 +310,18 @@ def apply_monthly_scoring(full_df: pd.DataFrame,
     Score mensual base. IG es opcional:
     - rrss_policy='renormalize': si falta IG, se quita su 15% y se redistribuye.
     - rrss_policy='neutral': si falta IG, se usa 0.5.
+    (OJO: luego vamos a reemplazar/mezclar RRSS con TikTok afuera de esta función)
     """
-    # Casting
     full_df['Cost_google']          = pd.to_numeric(full_df.get('Cost_google', 0), errors='coerce').fillna(0)
     full_df['Cost_meta']            = pd.to_numeric(full_df.get('Cost_meta', 0), errors='coerce').fillna(0)
     full_df['Purchase revenue']     = pd.to_numeric(full_df.get('Purchase revenue', 0), errors='coerce').fillna(0)
     full_df['Purchases']            = pd.to_numeric(full_df.get('Purchases', 0), errors='coerce').fillna(0)
     full_df['User conversion rate'] = pd.to_numeric(full_df.get('User conversion rate', 0), errors='coerce').fillna(0)
 
-    # Derivadas
     full_df['Cost_total'] = full_df['Cost_google'] + full_df['Cost_meta']
     full_df['CAC']  = full_df.apply(lambda r: r['Cost_total']/r['Purchases'] if r['Purchases']>0 else 0, axis=1)
     full_df['ROAS'] = full_df.apply(lambda r: r['Purchase revenue']/r['Cost_total'] if r['Cost_total']>0 else 0, axis=1)
 
-    # Benchmarks
     benchmark_conversion = 0.006
     benchmark_roas = 2.5
     benchmark_aov = 50000
@@ -273,7 +351,7 @@ def apply_monthly_scoring(full_df: pd.DataFrame,
     full_df['puntaje_cac'] = full_df['CAC'].apply(
         lambda x: puntuar_cac(x, benchmark_cac_ideal, benchmark_cac_muy_alto))
 
-    # RRSS opcional
+    # IG (provisorio; luego hacemos blend con TikTok)
     rrss_disponible = (seguidores is not None) and (engagement_rate_redes is not None)
     if rrss_disponible:
         if engagement_rate_redes > 1:
@@ -284,7 +362,8 @@ def apply_monthly_scoring(full_df: pd.DataFrame,
         rrss_score = float(np.clip(np.log(seguidores + 1) * engagement_rate_redes, 0, 1))
     else:
         rrss_score = 0.5 if rrss_policy == "neutral" else 0.0
-    full_df['RRSS_score']   = rrss_score
+
+    full_df['RRSS_score']   = rrss_score   # IG provisional (0..1)
     full_df['puntaje_rrss'] = rrss_score
 
     # Pesos y renormalización si falta IG (renormalize)
@@ -322,12 +401,11 @@ def write_minimal_score(project_id: str, target_table: str, client_key: str, sco
             query_parameters=[bigquery.ScalarQueryParameter("client_key","STRING",client_key)]
         )
     ).result()
-    # score ya debe venir entero 1..1000; por las dudas, casteamos
     score_int = int(score)
     out = pd.DataFrame([{"client_key": client_key, "score": score_int}])
     bq.load_table_from_dataframe(out, target_table).result()
 
-# ── Overlays opcionales (merchant / bcra) — sin cambios funcionales aquí ─────
+# ── Overlays opcionales (merchant / bcra) — sin cambios ───────────────────────
 def compute_merchant_basic(merchant_json: Dict[str, Any]) -> Tuple[Optional[float], Dict[str, Any], List[str]]:
     try:
         products = merchant_json.get("metrics", {}).get("products", {}).get("products", []) or []
@@ -413,7 +491,7 @@ def bcra_extract_12m_from_historicas(bcra_json: Dict[str, Any]) -> Dict[str, Any
     return {
         "as_of_month": latest_ym,
         "worst_situation_12m": int(worst),
-        "months_bad_12m": int(months_bad),
+        "months_bad_12m": int(months_bad or 0),
         "entity_count_12m": len(entities),
         "periods_considered": sorted(per_period.keys()),
     }
@@ -472,7 +550,7 @@ def score_monthly_simple(project_id: str,
                          target_table: str,
                          months_back: int = 24,
                          aggregate_last_n: int = 12,
-                         seguidores: Optional[int] = None,           # overrides opcionales
+                         seguidores: Optional[int] = None,           # overrides IG opcionales
                          engagement_rate_redes: Optional[float] = None,
                          aggregation_method: str = "mean_last_n",
                          rrss_policy: str = "renormalize",
@@ -480,7 +558,9 @@ def score_monthly_simple(project_id: str,
                          merchant_json: Optional[Dict[str, Any]] = None,
                          bcra_json: Optional[Dict[str, Any]] = None,
                          wM: float = 0.08,
-                         wB: float = 0.07) -> int:
+                         wB: float = 0.07,
+                         rrss_blend_policy: str = "split"            # NEW: cómo mezclar IG+TikTok
+                         ) -> int:
     logger = get_run_logger()
     ensure_target_table(project_id, target_table)
 
@@ -489,7 +569,7 @@ def score_monthly_simple(project_id: str,
     if panel.empty:
         raise RuntimeError("No hay datos de panel mensual para el rango solicitado.")
 
-    # 2) IG: si NO vinieron overrides, leo de BQ; si vinieron, uso los pasados
+    # 2) IG: si NO vinieron overrides, leo de BQ
     ig_seguidores: Optional[int] = seguidores
     ig_engagement: Optional[float] = engagement_rate_redes
     if ig_seguidores is None or ig_engagement is None:
@@ -502,17 +582,54 @@ def score_monthly_simple(project_id: str,
     else:
         logger.info(f"[IG] overrides recibidos: seguidores={ig_seguidores}, engagement={ig_engagement}")
 
-    # 3) Scoring base
+    # 2.1) Scoring base (provisorio con RRSS=IG)
     scored = apply_monthly_scoring(
         panel,
         seguidores=ig_seguidores,
         engagement_rate_redes=ig_engagement,
         rrss_policy=rrss_policy
     )
-    base_score_value = aggregate_client_score(scored, months_to_average=aggregate_last_n, method=aggregation_method)
+
+    # 2.2) TikTok features → score 0..1
+    tiktok_row = None
+    try:
+        tiktok_row = read_latest_tiktok_features(project_id, client_key)
+    except Exception as e:
+        logger.warning(f"[TIKTOK] no disponible: {e}")
+
+    tt01, tt_obs = compute_tiktok_score01(tiktok_row)
+    tt01 = tt01 if (tt01 is not None and tt_obs) else None
+    if tt01 is not None:
+        logger.info(f"[TIKTOK] score01={tt01:.3f} (observable={tt_obs})")
+    else:
+        logger.info(f"[TIKTOK] sin datos observables (usar IG si disponible)")
+
+    # 2.3) IG componente 0..1 (promedio mensual de lo ya calculado)
+    ig01 = float(np.clip(scored['RRSS_score'].mean(), 0.0, 1.0)) if 'RRSS_score' in scored.columns else None
+    if ig_seguidores is None or ig_engagement is None:
+        # si IG no estaba (renormalize), RRSS_score pudo quedar 0; en ese caso lo tratamos como None
+        if rrss_policy == "renormalize":
+            ig01 = None
+
+    # 2.4) Blend IG+TikTok dentro del 15% RRSS
+    rrss_component01 = blend_rrss(ig01, tt01, policy=rrss_blend_policy)
+    logger.info(f"[RRSS] blend policy={rrss_blend_policy}  ig01={ig01}  tt01={tt01}  -> rrss01={rrss_component01}")
+
+    # 2.5) Recalcular score mensual con el componente RRSS blended (peso 15%)
+    w = {"ventas": 0.35, "roas": 0.20, "conv": 0.15, "cac": 0.15, "rrss": 0.15}
+    rrss_final01 = rrss_component01 if rrss_component01 is not None else (0.5 if rrss_policy=="neutral" else 0.0)
+    scored['rrss_component01_override'] = rrss_final01
+    scored['score_benchmark_rrss_override'] = (
+        w["ventas"]*scored['puntaje_ventas'] +
+        w["roas"]  *scored['puntaje_roas'] +
+        w["conv"]  *scored['puntaje_conversion'] +
+        w["cac"]   *scored['puntaje_cac'] +
+        w["rrss"]  *scored['rrss_component01_override']
+    )
+    base_score_value = float(scored['score_benchmark_rrss_override'].tail(aggregate_last_n).mean() * 100.0)
     base01 = max(0.0, min(1.0, base_score_value / 100.0))
 
-    # 4) Overlays opcionales
+    # 3) Overlays opcionales
     m_score01: Optional[float] = None; m_dbg: Dict[str, Any] = {}; m_flags: List[str] = []
     if merchant_json is not None:
         m_score01, m_dbg, m_flags = compute_merchant_basic(merchant_json)
@@ -525,24 +642,26 @@ def score_monthly_simple(project_id: str,
             months_bad_12m=agg.get("months_bad_12m")
         )
 
-    # 5) Blend + caps
+    # 4) Blend + caps BCRA
     blended01 = blend_overlay(base01, m_score01, b_score01, wM=wM, wB=wB)
     blended01_capped = apply_bcra_overrides(blended01, b_flags)
 
-    # 6) Escala final a 1..1000 entero (clamp por las dudas)
+    # 5) Escala final a 1..1000 entero
     score_value = int(round(blended01_capped * 1000.0))
     score_value = max(1, min(1000, score_value))
 
-    # 7) Persistencia
+    # 6) Persistencia
     write_minimal_score(project_id, target_table, client_key, score_value)
 
-    logger.info(
-        f"[BASE] {base_score_value:.2f} "
-        f"[M] {m_dbg} flags={m_flags} "
-        f"[BCRA] {b_dbg} flags={b_flags} "
+    get_run_logger().info(
+        f"[BASE] {base_score_value:.2f}  "
+        f"[RRSS blend] IG={ig01} TT={tt01} rrss01={rrss_final01}  "
+        f"[M] {m_dbg} flags={m_flags}  "
+        f"[BCRA] {b_dbg} flags={b_flags}  "
         f"[FINAL] {score_value:d}"
     )
     return score_value
+
 
 if __name__ == "__main__":
     # correr local (usará ADC si no definís SERVICE_ACCOUNT_B64)
@@ -554,9 +673,10 @@ if __name__ == "__main__":
         aggregate_last_n=12,
         rrss_policy="renormalize",
         ga_fallback_aov=50000,
-        # si querés forzar overrides de IG para probar:
+        # overrides IG para test rápidos:
         # seguidores=1200,
         # engagement_rate_redes=0.012,
         wM=0.08,
-        wB=0.07
+        wB=0.07,
+        rrss_blend_policy="split"   # split (50/50), best, ig_only, tt_only
     )

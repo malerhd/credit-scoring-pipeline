@@ -1,4 +1,3 @@
-# flows/transform_flow.py
 from __future__ import annotations
 
 from prefect import flow, task, get_run_logger
@@ -97,11 +96,10 @@ def read_json(gcs_path: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────
-# Parsers
+# Parsers existentes
 # ─────────────────────────────────────────────────────────
 @task
 def parse_meta_ads_monthly(payload: dict, client_key: str, platform: str) -> pd.DataFrame:
-    """Desanida y agrega por mes/campaña para Meta Ads (metrics → months → days)."""
     rows = []
     for m in payload.get("metrics", []):
         cid = m.get("campaign_id")
@@ -144,10 +142,6 @@ def parse_meta_ads_monthly(payload: dict, client_key: str, platform: str) -> pd.
 
 @task
 def parse_ga_to_monthly(payload: dict, client_key: str, platform: str) -> pd.DataFrame:
-    """
-    GA4: series.daily con fechas 'YYYYMMDD'. Agregamos mensual:
-      sessions, transactions, purchaseRevenue, averagePurchaseRevenue, purchaseConversionRate.
-    """
     daily = payload.get("series", {}).get("daily", [])
     if not daily:
         return pd.DataFrame()
@@ -181,9 +175,6 @@ def parse_ga_to_monthly(payload: dict, client_key: str, platform: str) -> pd.Dat
 
 @task
 def parse_tn_sales_to_monthly(payload: dict, client_key: str, platform: str, only_paid: bool = False) -> pd.DataFrame:
-    """
-    Tienda Nube → mensual (orders, gross_revenue, subtotal, discount, currency, avg_order_value).
-    """
     ventas = payload.get("ventas", [])
     if not ventas:
         vd = payload.get("ventas_diarias", {})
@@ -244,10 +235,6 @@ def parse_tn_sales_to_monthly(payload: dict, client_key: str, platform: str, onl
 # ─────────────────────────────────────────────────────────
 @task
 def parse_ig_metrics(payload: dict, client_key: str, platform: str) -> pd.DataFrame:
-    """
-    Espera campos típicos:
-      fetched_at, timestamp, username, followers, engagementRate, reach, impressions, likes, views, ...
-    """
     def _to_ts(v):
         if not v:
             return None
@@ -349,12 +336,6 @@ def parse_bcra_to_metrics(payload: dict, client_key: str, platform: str) -> pd.D
 # ─────────────────────────────────────────────────────────
 @task
 def parse_merchant_to_metrics(payload: dict, client_key: str, platform: str) -> pd.DataFrame:
-    """
-    Métricas alineadas a UI:
-      - Solo SOURCE='feed', dedup por offerId (fallback id)
-      - Aprobado: sin issues ERROR y destinos no 'disapproved/inactive'
-      - Mínimos: title, link, image, price(value+currency), availability ∈ {in stock, preorder, backorder}
-    """
     logger = get_run_logger()
 
     fetched_raw = (payload or {}).get("fetched_at")
@@ -464,6 +445,118 @@ def parse_merchant_to_metrics(payload: dict, client_key: str, platform: str) -> 
         "in_stock_share": float(in_stock_share),
         "merchant_basic": float(merchant_basic),
     }])
+
+
+# ─────────────────────────────────────────────────────────
+# NEW: TikTok (Open/Display API v2) → videos + agregado 30d
+# ─────────────────────────────────────────────────────────
+@task
+def parse_tiktok_openapi(payload: dict, client_key: str, platform: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Espera un payload estilo Open/Display API v2:
+      { fetched_at, user_info{open_id}, user_stats{follower_count}, videos:[{id,create_time,duration,view_count,like_count,comment_count,share_count}] }
+    Devuelve:
+      - df_videos (crudo por video, particionado por fetched_at)
+      - df_merchant_30d (agregado 30d + flags)
+    """
+    import pandas as pd
+
+    def _to_ts(v):
+        if not v:
+            return None
+        s = str(v).strip().replace("Z","+00:00").replace("+0000","+00:00")
+        try:
+            return pd.to_datetime(s, utc=True)
+        except Exception:
+            return None
+
+    fetched_at = _to_ts(payload.get("fetched_at")) or pd.Timestamp.now(tz="UTC")
+    ui = payload.get("user_info") or {}
+    stats = payload.get("user_stats") or {}
+    videos = payload.get("videos") or []
+
+    open_id = str(ui.get("open_id") or ui.get("openId") or "")
+    follower_count = int(stats.get("follower_count") or stats.get("followers") or 0)
+
+    # Video-level
+    vrows = []
+    for v in videos:
+        vid = str(v.get("id") or v.get("video_id") or "")
+        ct  = _to_ts(v.get("create_time") or v.get("publish_time") or v.get("publish_ts"))
+        dur = int(v.get("duration") or v.get("duration_sec") or 0)
+        views = int(v.get("view_count") or v.get("views") or 0)
+        likes = int(v.get("like_count") or v.get("likes") or 0)
+        coms  = int(v.get("comment_count") or v.get("comments") or 0)
+        shrs  = int(v.get("share_count") or v.get("shares") or 0)
+        vrows.append({
+            "client_key": client_key, "platform": platform,
+            "fetched_at": fetched_at, "open_id": open_id,
+            "video_id": vid, "publish_ts": ct,
+            "duration_sec": dur, "view_count": views,
+            "like_count": likes, "comment_count": coms, "share_count": shrs
+        })
+
+    df_videos = pd.DataFrame(vrows)
+
+    # Merchant-level (30d)
+    end_ts = fetched_at
+    start_ts = end_ts - pd.Timedelta(days=30)
+
+    if df_videos.empty:
+        df_merch = pd.DataFrame([{
+            "client_key": client_key, "platform": platform,
+            "as_of_date": end_ts.date(), "fetched_at": fetched_at, "open_id": open_id,
+            "videos_last_30d": 0, "views_30d": 0, "likes_30d": 0, "comments_30d": 0, "shares_30d": 0,
+            "er_30d": 0.0, "comment_rate_30d": 0.0, "share_rate_30d": 0.0,
+            "posts_last_28d": 0, "consistency_score": 0.0,
+            "followers": follower_count, "views_per_follower": 0.0,
+            "is_observable_30d": False
+        }])
+        return df_videos, df_merch
+
+    dv = df_videos[(df_videos["publish_ts"].notnull()) & (df_videos["publish_ts"] >= start_ts) & (df_videos["publish_ts"] <= end_ts)].copy()
+    dv["views"] = pd.to_numeric(dv["view_count"], errors="coerce").fillna(0)
+    dv["likes"] = pd.to_numeric(dv["like_count"], errors="coerce").fillna(0)
+    dv["comments"] = pd.to_numeric(dv["comment_count"], errors="coerce").fillna(0)
+    dv["shares"] = pd.to_numeric(dv["share_count"], errors="coerce").fillna(0)
+
+    videos_last_30d = int(dv.shape[0])
+    views_30d = int(dv["views"].sum())
+    likes_30d = int(dv["likes"].sum())
+    comments_30d = int(dv["comments"].sum())
+    shares_30d = int(dv["shares"].sum())
+
+    er_30d = float((likes_30d + comments_30d + shares_30d) / views_30d) if views_30d > 0 else 0.0
+    comment_rate_30d = float(comments_30d / views_30d) if views_30d > 0 else 0.0
+    share_rate_30d = float(shares_30d / views_30d) if views_30d > 0 else 0.0
+
+    # Consistencia (CV de intervalos entre posteos en días)
+    dv = dv.sort_values("publish_ts")
+    diffs = dv["publish_ts"].diff().dt.total_seconds().div(86400.0)  # días
+    if diffs.dropna().shape[0] >= 2:
+        mean_int = diffs.mean()
+        std_int  = diffs.std(ddof=0)
+        cv = (std_int / mean_int) if mean_int and mean_int > 0 else 1.0
+        consistency_score = float(max(0.0, min(1.0, 1.0 - cv)))
+    else:
+        consistency_score = 0.0
+
+    views_per_follower = float(views_30d / follower_count) if follower_count > 0 else 0.0
+
+    is_observable_30d = bool((videos_last_30d >= 3) and (views_30d >= 1000))
+
+    df_merch = pd.DataFrame([{
+        "client_key": client_key, "platform": platform,
+        "as_of_date": end_ts.date(), "fetched_at": fetched_at, "open_id": open_id,
+        "videos_last_30d": videos_last_30d, "views_30d": views_30d, "likes_30d": likes_30d,
+        "comments_30d": comments_30d, "shares_30d": shares_30d,
+        "er_30d": er_30d, "comment_rate_30d": comment_rate_30d, "share_rate_30d": share_rate_30d,
+        "posts_last_28d": videos_last_30d, "consistency_score": consistency_score,
+        "followers": follower_count, "views_per_follower": views_per_follower,
+        "is_observable_30d": is_observable_30d
+    }])
+
+    return df_videos, df_merch
 
 
 # ─────────────────────────────────────────────────────────
@@ -589,6 +682,51 @@ def ensure_bq_objects(project_id: str):
     CLUSTER BY client_key, platform
     """).result()
 
+    # ── NEW: TikTok crudo por video
+    bq.query(f"""
+    CREATE TABLE IF NOT EXISTS `{project_id}.gold.tiktok_video_metrics` (
+      client_key STRING,
+      platform STRING,            -- 'tiktok'
+      fetched_at TIMESTAMP,
+      open_id STRING,
+      video_id STRING,
+      publish_ts TIMESTAMP,
+      duration_sec INT64,
+      view_count INT64,
+      like_count INT64,
+      comment_count INT64,
+      share_count INT64
+    )
+    PARTITION BY DATE(fetched_at)
+    CLUSTER BY client_key, platform
+    """).result()
+
+    # ── NEW: TikTok agregado 30d por merchant
+    bq.query(f"""
+    CREATE TABLE IF NOT EXISTS `{project_id}.gold.tiktok_merchant_metrics` (
+      client_key STRING,
+      platform STRING,            -- 'tiktok'
+      as_of_date DATE,
+      fetched_at TIMESTAMP,
+      open_id STRING,
+      videos_last_30d INT64,
+      views_30d INT64,
+      likes_30d INT64,
+      comments_30d INT64,
+      shares_30d INT64,
+      er_30d FLOAT64,
+      comment_rate_30d FLOAT64,
+      share_rate_30d FLOAT64,
+      posts_last_28d INT64,
+      consistency_score FLOAT64,
+      followers INT64,
+      views_per_follower FLOAT64,
+      is_observable_30d BOOL
+    )
+    PARTITION BY as_of_date
+    CLUSTER BY client_key, platform
+    """).result()
+
 
 # ─────────────────────────────────────────────────────────
 # BigQuery MERGE helpers
@@ -700,6 +838,40 @@ def upsert_merchant_metrics(df: pd.DataFrame, project_id: str) -> int:
     )
 
 
+# ── NEW: upserts TikTok ──────────────────────────────────
+@task
+def upsert_tiktok_video_metrics(df: pd.DataFrame, project_id: str) -> int:
+    if df.empty: return 0
+    creds = _get_gcp_credentials()
+    bq = bigquery.Client(project=project_id, credentials=creds) if creds else bigquery.Client(project=project_id)
+    target = f"{project_id}.gold.tiktok_video_metrics"
+    staging = target.replace(".gold.", ".gold._stg_")
+    bq.query(f"CREATE TABLE IF NOT EXISTS `{staging}` LIKE `{target}`").result()
+    bq.load_table_from_dataframe(df, staging).result()
+    bq.query(f"""
+    MERGE `{target}` T
+    USING `{staging}` S
+    ON T.client_key=S.client_key AND T.platform=S.platform AND T.video_id=S.video_id AND T.fetched_at=S.fetched_at
+    WHEN MATCHED THEN UPDATE SET
+      open_id=S.open_id, publish_ts=S.publish_ts, duration_sec=S.duration_sec,
+      view_count=S.view_count, like_count=S.like_count, comment_count=S.comment_count, share_count=S.share_count
+    WHEN NOT MATCHED THEN INSERT ROW
+    """).result()
+    bq.query(f"TRUNCATE TABLE `{staging}`").result()
+    return len(df)
+
+@task
+def upsert_tiktok_merchant_metrics(df: pd.DataFrame, project_id: str) -> int:
+    if df.empty: return 0
+    creds = _get_gcp_credentials()
+    bq = bigquery.Client(project=project_id, credentials=creds) if creds else bigquery.Client(project=project_id)
+    return _merge_table(
+        bq, df,
+        target=f"{project_id}.gold.tiktok_merchant_metrics",
+        keys=["client_key", "platform", "as_of_date"]
+    )
+
+
 # ─────────────────────────────────────────────────────────
 # Flow principal
 # ─────────────────────────────────────────────────────────
@@ -713,6 +885,7 @@ def transform_flow(gcs_path: str, client_key: str, platform: str, project_id: st
       - 'ig'       -> gold.social_metrics
       - 'bcra'     -> gold.bcra_metrics
       - 'merchant' -> gold.merchant_metrics
+      - 'tiktok'   -> gold.tiktok_video_metrics + gold.tiktok_merchant_metrics
     """
     logger = get_run_logger()
     ensure_bq_objects(project_id)
@@ -757,6 +930,13 @@ def transform_flow(gcs_path: str, client_key: str, platform: str, project_id: st
         n = upsert_merchant_metrics(df, project_id)
         logger.info(f"[MERCHANT] upsert rows: {n}  as_of={df.iloc[0]['as_of_date']}  n_products={int(df.iloc[0]['n_products'])}")
         return n
+
+    if p == "tiktok":
+        df_v, df_m = parse_tiktok_openapi(payload, client_key, p)
+        n1 = upsert_tiktok_video_metrics(df_v, project_id)
+        n2 = upsert_tiktok_merchant_metrics(df_m, project_id)
+        logger.info(f"[TIKTOK] upsert videos: {n1}  upsert merchant: {n2}  observable={bool(df_m.iloc[0]['is_observable_30d'])}")
+        return int(n1 + n2)
 
     msg = f"Plataforma no soportada: {platform}"
     logger.error(msg)
