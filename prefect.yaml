@@ -12,9 +12,7 @@ deployments:
       - prefect.deployments.steps.git_clone:
           repository: "https://github.com/malerhd/credit-scoring-pipeline.git"
           branch: "main"
-      - prefect.deployments.steps.set_working_directory:
-          directory: "{{ clone_directory }}"
-
+      
   - name: orchestrator-on-demand
     entrypoint: flows/orchestrate_client_flow.py:orchestrate_client
     work_pool:
