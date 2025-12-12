@@ -1,37 +1,56 @@
 version: 1
+
 deployments:
+
+  # --------------------------------------------------
+  # Transform flow (on demand)
+  # --------------------------------------------------
   - name: transform-on-demand
     entrypoint: flows/transform_flow.py:transform_flow
     work_pool:
       name: serverless-pool
     job_variables:
-      pip_packages: ["prefect","google-cloud-storage","google-cloud-bigquery","google-auth","pandas","numpy","pyarrow"]
+      pip_packages:
+        - prefect
+        - google-cloud-storage
+        - google-cloud-bigquery
+        - google-auth
+        - pandas
+        - numpy
+        - pyarrow
       env:
         SERVICE_ACCOUNT_B64: "{{ prefect.blocks.secret.gcpsab64 }}"
     pull:
       - prefect.deployments.steps.git_clone:
           repository: "https://github.com/malerhd/credit-scoring-pipeline.git"
           branch: "main"
-      
+
+  # --------------------------------------------------
+  # Orchestrator flow (on demand)
+  # --------------------------------------------------
   - name: orchestrator-on-demand
     entrypoint: flows/orchestrate_client_flow.py:orchestrate_client
     work_pool:
       name: serverless-pool
     job_variables:
-      pip_packages: ["prefect","google-cloud-storage","google-cloud-bigquery","google-auth","pandas","numpy","pyarrow"]
+      pip_packages:
+        - prefect
+        - google-cloud-storage
+        - google-cloud-bigquery
+        - google-auth
+        - pandas
+        - numpy
+        - pyarrow
       env:
         SERVICE_ACCOUNT_B64: "{{ prefect.blocks.secret.gcpsab64 }}"
     pull:
-  - prefect.deployments.steps.git_clone:
-      id: clone
-      repository: "https://github.com/malerhd/credit-scoring-pipeline.git"
-      branch: "main"
-      # Si el repo es público, dejá esto SIN token.
-      # Si es privado y ya creaste el block de credenciales, podés usar:
-      # access_token: "{{ prefect.blocks.github-credentials.github-credit-scoring.token }}"
-  - prefect.deployments.steps.set_working_directory:
-      directory: "{{ clone.directory }}"
+      - prefect.deployments.steps.git_clone:
+          repository: "https://github.com/malerhd/credit-scoring-pipeline.git"
+          branch: "main"
 
+  # --------------------------------------------------
+  # Scoring flow
+  # --------------------------------------------------
   - name: scoring-deploy
     entrypoint: flows/score_simple_flow.py:score_monthly_simple
     parameters:
@@ -43,12 +62,18 @@ deployments:
     work_pool:
       name: serverless-pool
     job_variables:
-      pip_packages: ["prefect","google-cloud-storage","google-cloud-bigquery","google-auth","pandas","numpy","pyarrow"]
+      pip_packages:
+        - prefect
+        - google-cloud-storage
+        - google-cloud-bigquery
+        - google-auth
+        - pandas
+        - numpy
+        - pyarrow
       env:
         SERVICE_ACCOUNT_B64: "{{ prefect.blocks.secret.gcpsab64 }}"
     pull:
       - prefect.deployments.steps.git_clone:
           repository: "https://github.com/malerhd/credit-scoring-pipeline.git"
           branch: "main"
-      - prefect.deployments.steps.set_working_directory:
-          directory: "{{ clone_directory }}"
+
