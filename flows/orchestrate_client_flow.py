@@ -6,7 +6,7 @@ import re
 import json
 import base64
 from urllib.parse import urlparse
-from typing import Optional  # <-- agregado
+from typing import Optional, List
 
 # Third-party
 from prefect import flow, get_run_logger
@@ -18,18 +18,25 @@ from google.oauth2 import service_account
 from flows.transform_flow import transform_flow
 from flows.score_simple_flow import score_monthly_simple
 
-# Supported platforms
-VALID_PLATFORMS = {"tn", "ga", "meta-ads", "ig", "bcra", "merchant"}
+
+# -----------------------------------------------------------------------------
+# Supported platforms (lógicas)
+# -----------------------------------------------------------------------------
+VALID_PLATFORMS = {
+    "tn",
+    "ga",
+    "meta-ads",
+    "ig",        # instagram / ig
+    "bcra",
+    "merchant",
+    "tiktok",
+}
 
 
 # -----------------------------------------------------------------------------
 # GCP CREDENTIALS
 # -----------------------------------------------------------------------------
 def _get_gcp_credentials():
-    """
-    Reads SERVICE_ACCOUNT_B64 (raw JSON or Base64).
-    If not present → uses ADC (default credentials).
-    """
     logger = get_run_logger()
     raw = (os.getenv("SERVICE_ACCOUNT_B64") or "").strip()
 
@@ -59,60 +66,66 @@ def _parse_gcs_uri(uri: str) -> tuple[str, str]:
     return u.netloc, u.path.lstrip("/")
 
 
-def _path_for(platform: str, client_key: str) -> str:
+def _paths_for(platform: str, client_key: str) -> List[str]:
+    """
+    Devuelve TODOS los paths posibles para una plataforma lógica
+    """
     base = f"gs://loopi-data-dev/{client_key}"
-    return {
-        "tn": f"{base}/tiendanube/snapshot-latest.json",
-        "ga": f"{base}/ga/snapshot-latest.json",
-        "meta-ads": f"{base}/meta-ads/snapshot-latest.json",
-        "ig": f"{base}/ig/snapshot-latest.json",
-        "bcra": f"{base}/bcra/snapshot-latest.json",
-        "merchant": f"{base}/merchant/snapshot-latest.json",
-    }[platform]
+
+    paths = {
+        "tn": [f"{base}/tiendanube/snapshot-latest.json"],
+        "ga": [f"{base}/ga/snapshot-latest.json"],
+        "meta-ads": [f"{base}/meta-ads/snapshot-latest.json"],
+
+        # Instagram: alias soportados
+        "ig": [
+            f"{base}/ig/snapshot-latest.json",
+            f"{base}/instagram/snapshot-latest.json",
+        ],
+
+        "bcra": [f"{base}/bcra/snapshot-latest.json"],
+        "merchant": [f"{base}/merchant/snapshot-latest.json"],
+
+        # TikTok
+        "tiktok": [f"{base}/tiktok/snapshot-latest.json"],
+    }
+
+    return paths[platform]
 
 
-def _gcs_fingerprint(uri: str, creds) -> str | None:
-    bucket, path = _parse_gcs_uri(uri)
+def _gcs_fingerprint(uris: List[str], creds) -> str | None:
+    """
+    Devuelve generation del PRIMER snapshot existente
+    """
     client = storage.Client(credentials=creds) if creds else storage.Client()
-    blob = client.bucket(bucket).blob(path)
 
-    if not blob.exists():
-        return None
+    for uri in uris:
+        bucket, path = _parse_gcs_uri(uri)
+        blob = client.bucket(bucket).blob(path)
 
-    blob.reload()
-    return str(blob.generation)
+        if blob.exists():
+            blob.reload()
+            return str(blob.generation)
+
+    return None
 
 
-# -----------------------------------------------------------------------------
-# IG JSON LOADER
-# -----------------------------------------------------------------------------
-def _load_ig_metrics(path: str, creds):
+def _resolve_existing_uri(uris: List[str], creds) -> str | None:
     """
-    Loads followers + engagement_rate from IG JSON file (local or GCS).
+    Devuelve el path real existente (para pasarlo al transform_flow)
     """
-    if path.startswith("gs://"):
-        bucket, bpath = _parse_gcs_uri(path)
-        sc = storage.Client(credentials=creds) if creds else storage.Client()
-        raw = sc.bucket(bucket).blob(bpath).download_as_text()
-    else:
-        with open(path, "r", encoding="utf-8") as f:
-            raw = f.read()
+    client = storage.Client(credentials=creds) if creds else storage.Client()
 
-    data = json.loads(raw)
+    for uri in uris:
+        bucket, path = _parse_gcs_uri(uri)
+        if client.bucket(bucket).blob(path).exists():
+            return uri
 
-    followers = int(data.get("followers") or 0)
-    engagement = data.get("engagementRate", data.get("engagement_rate", 0))
-
-    try:
-        engagement = float(engagement)
-    except:
-        engagement = 0.0
-
-    return followers, engagement
+    return None
 
 
 # -----------------------------------------------------------------------------
-# BIGQUERY CURSORS (avoid re-processing)
+# BIGQUERY CURSORS
 # -----------------------------------------------------------------------------
 def _read_cursor(bq, project_id, client_key, platform):
     sql = f"""
@@ -138,8 +151,13 @@ def _read_cursor(bq, project_id, client_key, platform):
 def _write_cursor(bq, project_id, client_key, platform, generation):
     sql = f"""
     MERGE `{project_id}.ops.snapshot_cursor` T
-    USING (SELECT @ck AS client_key, @pf AS platform, @g AS last_generation,
-                  CURRENT_TIMESTAMP() AS last_updated) S
+    USING (
+      SELECT
+        @ck AS client_key,
+        @pf AS platform,
+        @g  AS last_generation,
+        CURRENT_TIMESTAMP() AS last_updated
+    ) S
     ON T.client_key=S.client_key AND T.platform=S.platform
     WHEN MATCHED THEN
       UPDATE SET last_generation=S.last_generation, last_updated=S.last_updated
@@ -147,7 +165,6 @@ def _write_cursor(bq, project_id, client_key, platform, generation):
       INSERT (client_key, platform, last_generation, last_updated)
       VALUES (S.client_key, S.platform, S.last_generation, S.last_updated)
     """
-
     bq.query(
         sql,
         job_config=bigquery.QueryJobConfig(
@@ -178,8 +195,8 @@ def _normalize_platforms_arg(platforms):
                 return [str(x).strip() for x in val if str(x).strip()]
             if isinstance(val, str):
                 return [val.strip()]
-        except:
-            return [t.strip() for t in s.replace("\n", ",").split(",") if t.strip()]
+        except Exception:
+            return [t.strip() for t in s.split(",") if t.strip()]
     return [str(platforms).strip()]
 
 
@@ -194,59 +211,36 @@ def orchestrate_client(
     months_back: int = 24,
     aggregate_last_n: int = 12,
     platforms: list[str] | None = None,
-    max_age_minutes: int = 1440,
-    ig_metrics_path: Optional[str] = None,  # <-- ahora opcional
 ):
     logger = get_run_logger()
 
-    # Credentials
     creds = _get_gcp_credentials()
     bq = bigquery.Client(project=project_id, credentials=creds) if creds else bigquery.Client(project=project_id)
 
     logger.info(f"[START] client={client_key} project={bq.project}")
 
-    # --- IG metrics: opcional/skippeable ---
-    # fallback a ENV si no vino por parámetro
-    if not ig_metrics_path or not ig_metrics_path.strip():
-        ig_metrics_path = (os.getenv("IG_METRICS_PATH") or "").strip()
-
-    seguidores: int = 0
-    engagement_rate_redes: float = 0.0
-
-    if ig_metrics_path:
-        try:
-            seguidores, engagement_rate_redes = _load_ig_metrics(ig_metrics_path, creds)
-            logger.info(f"[IG] seguidores={seguidores}, engagement={engagement_rate_redes}")
-        except Exception as e:
-            logger.warning(f"[IG] Skipping IG metrics (load failed): {e}")
-    else:
-        logger.info("[IG] Skipping IG metrics: ig_metrics_path not provided")
-
-    # Normalize platforms arg
     platforms = _normalize_platforms_arg(platforms)
 
-    # Autodetect from GCS if empty
+    # Autodetección
     if not platforms:
         detected = []
         for p in VALID_PLATFORMS:
-            uri = _path_for(p, client_key)
-            if _gcs_fingerprint(uri, creds):
+            uris = _paths_for(p, client_key)
+            if _gcs_fingerprint(uris, creds):
                 detected.append(p)
         platforms = detected
         logger.info(f"[AUTODETECT] platforms={platforms}")
 
-    # Filter valid ones
     platforms = [p for p in platforms if p in VALID_PLATFORMS]
     if not platforms:
         logger.warning("No platforms to process. Exiting.")
         return 0
 
-    # Process
     processed_any = False
 
     for p in platforms:
-        uri = _path_for(p, client_key)
-        fp = _gcs_fingerprint(uri, creds)
+        uris = _paths_for(p, client_key)
+        fp = _gcs_fingerprint(uris, creds)
 
         if not fp:
             logger.warning(f"[{p}] No snapshot found, skipping")
@@ -255,6 +249,11 @@ def orchestrate_client(
         last = _read_cursor(bq, project_id, client_key, p)
         if last == fp:
             logger.info(f"[{p}] Snapshot unchanged ({fp}), skipping")
+            continue
+
+        uri = _resolve_existing_uri(uris, creds)
+        if not uri:
+            logger.warning(f"[{p}] Snapshot vanished before processing")
             continue
 
         try:
@@ -273,22 +272,17 @@ def orchestrate_client(
         except Exception as e:
             logger.error(f"[{p}] Transform error: {e}")
 
-    # Scoring only if updates
+    # Scoring
     if processed_any:
         score = score_monthly_simple(
             project_id=project_id,
             client_key=client_key,
-            target_table=(
-                target_table or f"{project_id}.gold.scoring_client_minimal"
-            ),
+            target_table=target_table or f"{project_id}.gold.scoring_client_minimal",
             months_back=months_back,
             aggregate_last_n=aggregate_last_n,
-            seguidores=seguidores,
-            engagement_rate_redes=engagement_rate_redes,
         )
         logger.info(f"[SCORE] client={client_key} score={score}")
         return score
 
     logger.info("No updates → skip scoring.")
     return 0
-

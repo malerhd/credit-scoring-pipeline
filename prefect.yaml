@@ -24,11 +24,15 @@ deployments:
       env:
         SERVICE_ACCOUNT_B64: "{{ prefect.blocks.secret.gcpsab64 }}"
     pull:
-      - prefect.deployments.steps.git_clone:
-          repository: "https://github.com/malerhd/credit-scoring-pipeline.git"
-          branch: "main"
-      - prefect.deployments.steps.set_working_directory:
-          directory: "{{ clone_directory }}"
+  - prefect.deployments.steps.git_clone:
+      id: clone
+      repository: "https://github.com/malerhd/credit-scoring-pipeline.git"
+      branch: "main"
+      # Si el repo es público, dejá esto SIN token.
+      # Si es privado y ya creaste el block de credenciales, podés usar:
+      # access_token: "{{ prefect.blocks.github-credentials.github-credit-scoring.token }}"
+  - prefect.deployments.steps.set_working_directory:
+      directory: "{{ clone.directory }}"
 
   - name: scoring-deploy
     entrypoint: flows/score_simple_flow.py:score_monthly_simple
