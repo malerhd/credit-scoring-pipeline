@@ -662,21 +662,3 @@ def score_monthly_simple(project_id: str,
     )
     return score_value
 
-
-if __name__ == "__main__":
-    # correr local (usará ADC si no definís SERVICE_ACCOUNT_B64)
-    score_monthly_simple(
-        project_id="loopi-470817",
-        client_key="analytics@redhookdata.com",
-        target_table="loopi-470817.gold.scoring_client_minimal",
-        months_back=24,
-        aggregate_last_n=12,
-        rrss_policy="renormalize",
-        ga_fallback_aov=50000,
-        # overrides IG para test rápidos:
-        # seguidores=1200,
-        # engagement_rate_redes=0.012,
-        wM=0.08,
-        wB=0.07,
-        rrss_blend_policy="split"   # split (50/50), best, ig_only, tt_only
-    )
